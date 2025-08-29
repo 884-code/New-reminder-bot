@@ -33,4 +33,4 @@ build/
 dist/
 
 # Local
-reminder_bot.db 
+reminder_bot.db *.save
