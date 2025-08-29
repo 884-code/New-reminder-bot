@@ -182,6 +182,30 @@ class UndoButton(_BaseBtn):
     async def callback(self,it): await self._handle(it,'accepted')
 
 
+@bot.event
+async def on_ready():
+    try:
+        logger.info(f'{bot.user} has landed!')
+        logger.info(f"Bot is in {len(bot.guilds)} guilds")
+    except Exception:
+        pass
+    # init_database は存在すれば実行
+    try:
+        init_database()
+    except Exception as e:
+        try: logger.warning(f"[on_ready] init_database skipped: {e}")
+        except Exception: pass
+    # 各ギルドでロール作成（存在すれば）
+    try:
+        for guild in bot.guilds:
+            try:
+                await setup_roles(guild)
+            except Exception as e:
+                try: logger.warning(f"[on_ready] setup_roles skipped in {guild.id}: {e}")
+                except Exception: pass
+    except Exception as e:
+        try: logger.warning(f"[on_ready] guild loop skipped: {e}")
+        except Exception: pass
 
 @bot.event
 async def on_interaction(interaction):
@@ -1293,61 +1317,38 @@ async def cmd_assign(ctx):
         await ctx.reply("❌ 実行中にエラーが発生しました。")
 # ==== /PREFIX_ASSIGN_COMMAND ====
 
+# ==== READY_GUARD_FINAL ====
+_ready_fired = False
 
-# ==== PING_COMMAND ====
-@bot.command(name="ping")
-async def _ping(ctx):
+@bot.event
+async def on_ready():
+    global _ready_fired
+    if _ready_fired:
+        return            # 再入禁止（2回目以降は何もしない）
+    _ready_fired = True
+
     try:
-        await ctx.reply("pong")
-    except Exception as e:
-        try: logger.error(f"[ping] {e}", exc_info=True)
-        except: pass
-# ==== /PING_COMMAND ====
-
-# ==== CLEAN_SETUP_HOOK ====
-import discord as _d, asyncio as _a, logging as _lg
-log = _lg.getLogger(__name__)
-
-async def __clean_setup_hook():
-    await bot.wait_until_ready()
-    try:
-        log.info(f"{bot.user} has landed!")
-        log.info(f"Bot is in {len(bot.guilds)} guilds")
+        logger.info(f'{bot.user} has landed!')
+        logger.info(f"Bot is in {len(bot.guilds)} guilds")
     except Exception:
         pass
-    # init_database / setup_roles は存在すれば実行（無ければ静かにスキップ）
+
+    # init_database / setup_roles は存在すれば実行（無ければスキップ）
     try:
         init_database()
-        log.info("[startup] init_database OK")
     except Exception as e:
-        try: log.warning(f"[startup] init_database skipped: {e}")
+        try: logger.warning(f"[on_ready] init_database skipped: {e}")
         except: pass
+
     try:
         for g in bot.guilds:
-            try: 
-                await setup_roles(g)
+            try: await setup_roles(g)
             except Exception as e:
-                try: log.warning(f"[startup] setup_roles skipped in {getattr(g,'id',None)}: {e}")
+                try: logger.warning(f"[on_ready] setup_roles skipped in {getattr(g,'id',None)}: {e}")
                 except: pass
     except Exception:
         pass
-    # プレゼンスをONLINEに
-    try:
-        await bot.change_presence(
-            status=_d.Status.online,
-            activity=_d.Activity(type=_d.ActivityType.watching, name="タスク受付中")
-        )
-    except Exception:
-        pass
-
-# 既存の setup_hook をすべて無視して“これだけ”使う
-bot.setup_hook = __clean_setup_hook
-# ==== /CLEAN_SETUP_HOOK ====
-
-
-
-
-
+# ==== /READY_GUARD_FINAL ====
 
 if __name__ == "__main__":
     import os
@@ -1675,6 +1676,39 @@ async def __rename_min(thread: __dd.Thread, status: str):
     if new != cur:
         await thread.edit(name=new)
 
+@bot.command(name='紐付け', aliases=['bind'])
+async def bind_thread_command(ctx, task_id: int):
+    """（スレッド内）このスレッドを指定Task IDに紐付けて、色も即同期します"""
+    try:
+        if not isinstance(ctx.channel, __dd.Thread):
+            await ctx.reply("このコマンドは**スレッドの中**で実行してください。")
+            return
+
+        # DBに thread_id を保存
+        conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
+        cur.execute("UPDATE tasks SET thread_id=? WHERE id=?", (ctx.channel.id, task_id))
+        if cur.rowcount == 0:
+            conn.commit(); conn.close()
+            await ctx.reply(f"❌ Task ID {task_id} が見つかりません。")
+            return
+        conn.commit(); conn.close()
+
+        # 直ちに色を同期
+        status = await __helper_read_status_by_id(task_id)
+        try:
+            # 既にある helper があれば使う
+            if '_rename_thread_to_status' in globals():
+                await _rename_thread_to_status(ctx.channel, status)
+            else:
+                await __rename_min(ctx.channel, status)
+        except Exception:
+            await __rename_min(ctx.channel, status)
+
+        await ctx.reply(f"✅ 紐付け完了（Task ID {task_id} / status={status}）")
+    except Exception as e:
+        try: logger.error(f"[bind] error: {e}", exc_info=True)
+        except: pass
+        await ctx.reply("❌ 紐付け中にエラーが発生しました。")
 # ==== /BIND_THREAD_TO_TASK ====
 # ==== INIT_DB_AND_ROLES (日本語版/エラー安全) ====
 def init_database():

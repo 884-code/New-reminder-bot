@@ -1,0 +1,639 @@
+# -*- coding: utf-8 -*-
+# mybot.py (failsafe setup edition)
+import os, re, json, sqlite3, logging, asyncio
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")]
+)
+logger = logging.getLogger("taskbot")
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned_or("!", "！", "/"),
+    intents=intents,
+    case_insensitive=True,
+    help_command=None,
+    max_messages=100,
+)
+
+DB_PATH = "reminder_bot.db"
+def db_exec(q: str, params: tuple = (), fetch=False):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute(q, params); rows = cur.fetchall() if fetch else None
+    conn.commit(); conn.close(); return rows
+
+def init_db():
+    db_exec("""CREATE TABLE IF NOT EXISTS admins(user_id INTEGER, guild_id INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,guild_id))""")
+    db_exec("""CREATE TABLE IF NOT EXISTS instructors(user_id INTEGER, guild_id INTEGER, target_users TEXT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,guild_id))""")
+    db_exec("""CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, instructor_id INTEGER, assignee_id INTEGER,
+        task_name TEXT, due_date TIMESTAMP, status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        message_id INTEGER, channel_id INTEGER, reminder_sent INTEGER DEFAULT 0)""")
+    cols = db_exec("PRAGMA table_info(tasks)", fetch=True)
+    if "reminder_sent" not in [c[1] for c in cols]:
+        db_exec("ALTER TABLE tasks ADD COLUMN reminder_sent INTEGER DEFAULT 0")
+
+def is_admin(uid:int,gid:int)->bool: return bool(db_exec("SELECT 1 FROM admins WHERE user_id=? AND guild_id=?", (uid,gid), fetch=True))
+def is_instructor(uid:int,gid:int)->bool: return bool(db_exec("SELECT 1 FROM instructors WHERE user_id=? AND guild_id=?", (uid,gid), fetch=True))
+
+def insert_task(gid:int,iid:int,aid:int,name:str,due:datetime)->int:
+    db_exec("INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date) VALUES (?,?,?,?,?)", (gid,iid,aid,name,due))
+    return db_exec("SELECT last_insert_rowid()", fetch=True)[0][0]
+
+def get_task(tid:int):
+    r=db_exec("SELECT * FROM tasks WHERE id=?", (tid,), fetch=True)
+    return r[0] if r else None
+
+async def ensure_mgmt(guild:discord.Guild)->Optional[discord.TextChannel]:
+    for name in ("task-management","タスク管理"):
+        ch = discord.utils.get(guild.channels, name=name)
+        if isinstance(ch, discord.TextChannel): return ch
+    try:
+        return await guild.create_text_channel("task-management", overwrites={guild.default_role: discord.PermissionOverwrite(read_messages=False)})
+    except Exception as e:
+        logger.error(f"mgmt create failed: {e}"); return None
+
+async def ensure_personal(guild:discord.Guild,user:discord.Member)->Optional[discord.TextChannel]:
+    name=f"to-{user.display_name}".lower().replace(" ","-")
+    ch=discord.utils.get(guild.channels,name=name)
+    if isinstance(ch,discord.TextChannel): return ch
+    try:
+        ow={guild.default_role: discord.PermissionOverwrite(read_messages=False), user: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
+        return await guild.create_text_channel(name=name, overwrites=ow, topic=f"{user.display_name} の個人タスク")
+    except Exception as e:
+        logger.error(f"personal create failed: {e}"); return None
+
+def parse_date(s:str)->Optional[datetime]:
+    now=datetime.now(); t=s.strip().lower()
+    m=re.search(r'(\d{1,2}):(\d{2})$',t)
+    if m: hour,minute=int(m.group(1)),int(m.group(2)); t=t[:m.start()].strip()
+    else: hour,minute=23,59
+    pats=[(r'^(今日|today)$',lambda m:now),(r'^(明日|tomorrow)$',lambda m:now+timedelta(days=1)),
+          (r'^(明後日|day after tomorrow)$',lambda m:now+timedelta(days=2)),(r'^(昨日|yesterday)$',lambda m:now-timedelta(days=1)),
+          (r'^(\d+)\s*(日後|days?)$',lambda m:now+timedelta(days=int(m.group(1)))),
+          (r'^(\d+)\s*(週間後|weeks?)$',lambda m:now+timedelta(weeks=int(m.group(1)))),
+          (r'^(\d+)\s*(時間後|hours?)$',lambda m:now+timedelta(hours=int(m.group(1)))),
+          (r'^(\d+)\s*(分後|mins?|minutes?)$',lambda m:now+timedelta(minutes=int(m.group(1)))) ]
+    for pat,fn in pats:
+        mm=re.match(pat,t)
+        if mm: dt=fn(mm); return dt.replace(hour=hour,minute=minute,second=0,microsecond=0)
+    wk={'月':0,'火':1,'水':2,'木':3,'金':4,'土':5,'日':6,'monday':0,'tuesday':1,'wednesday':2,'thursday':3,'friday':4,'saturday':5,'sunday':6,'mon':0,'tue':1,'wed':2,'thu':3,'fri':4,'sat':5,'sun':6}
+    for name,num in wk.items():
+        if name in t:
+            d=num-now.weekday(); d+=7 if d<=0 else 0
+            return (now+timedelta(days=d)).replace(hour=hour,minute=minute,second=0,microsecond=0)
+    abs_p=[r'^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$',r'^(\d{1,2})[/-](\d{1,2})$',r'^(\d{4})年(\d{1,2})月(\d{1,2})日$',r'^(\d{1,2})月(\d{1,2})日$']
+    for pat in abs_p:
+        mm=re.match(pat,t)
+        if mm:
+            g=mm.groups()
+            if len(g)==3 and len(g[0])==4: y,mo,d=int(g[0]),int(g[1]),int(g[2])
+            elif len(g)==3: mo,d,y=int(g[0]),int(g[1]),now.year
+            else: mo,d,y=int(g[0]),int(g[1]),now.year
+            try: return datetime(y,mo,d,hour,minute)
+            except ValueError: return None
+    return None
+
+STATUS_COLORS={'pending':discord.Color.red(),'accepted':discord.Color.gold(),'completed':discord.Color.green(),'declined':discord.Color.dark_gray(),'abandoned':discord.Color.dark_red()}
+STATUS_EMOJI={'pending':'🟥','accepted':'🟨','completed':'🟩','declined':'⚪','abandoned':'🟫'}
+STATUS_NAME={'pending':'Pending','accepted':'In Progress','completed':'Completed','declined':'Declined','abandoned':'Problem'}
+
+def build_embed(trow,status:Optional[str]=None)->discord.Embed:
+    st=status or trow[6]
+    try: due_ts=int(datetime.fromisoformat(str(trow[5])).timestamp())
+    except Exception: due_ts=int(datetime.strptime(str(trow[5]),"%Y-%m-%d %H:%M:%S").timestamp())
+    emb=discord.Embed(title=f"📋 {trow[4]}", color=STATUS_COLORS.get(st, discord.Color.blurple()))
+    emb.add_field(name="Due Date", value=f"<t:{due_ts}:F>", inline=True)
+    emb.add_field(name="Status", value=f"{STATUS_EMOJI.get(st,'⚪')} {STATUS_NAME.get(st,st)}", inline=True)
+    emb.add_field(name="Updated", value=f"<t:{int(datetime.now().timestamp())}:R>", inline=True)
+    emb.set_footer(text=f"Task ID: {trow[0]}"); return emb
+
+class TaskView(discord.ui.View):
+    def __init__(self, tid:int, aid:int, iid:int, status:str):
+        super().__init__(timeout=None); self.tid, self.aid, self.iid, self.status=tid,aid,iid,status; self._setup()
+    def _setup(self):
+        self.clear_items()
+        if self.status=='pending': self.add_item(AcceptButton(self.tid)); self.add_item(DeclineButton(self.tid))
+        elif self.status=='accepted': self.add_item(CompleteButton(self.tid)); self.add_item(AbandonButton(self.tid))
+        elif self.status=='completed': self.add_item(UndoButton(self.tid))
+
+class _BaseBtn(discord.ui.Button):
+    def __init__(self,label,style,cid): super().__init__(label=label, style=style, custom_id=cid)
+    async def _handle(self,it:discord.Interaction,new_status:str):
+        t=db_exec("SELECT * FROM tasks WHERE id=?", (int(self.custom_id.split('_')[-1]),), fetch=True)
+        if not t: await it.response.send_message("❌ Task not found.", ephemeral=True); return
+        t=t[0]
+        if it.user.id!=t[3]: await it.response.send_message("❌ You are not the assignee.", ephemeral=True); return
+        db_exec("UPDATE tasks SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status,t[0]))
+        t2=db_exec("SELECT * FROM tasks WHERE id=?", (t[0],), fetch=True)[0]
+        await it.response.edit_message(embed=build_embed(t2,new_status), view=TaskView(t2[0],t2[3],t2[2],new_status))
+
+class AcceptButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("✅ Accept", discord.ButtonStyle.success, f"accept_task_{tid}")
+    async def callback(self,it): await self._handle(it,'accepted')
+class DeclineButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("❌ Decline", discord.ButtonStyle.danger, f"decline_task_{tid}")
+    async def callback(self,it): await self._handle(it,'declined')
+class CompleteButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("📝 Complete", discord.ButtonStyle.success, f"complete_task_{tid}")
+    async def callback(self,it): await self._handle(it,'completed')
+class AbandonButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("⚠️ Problem", discord.ButtonStyle.danger, f"abandon_task_{tid}")
+    async def callback(self,it): await self._handle(it,'abandoned')
+class UndoButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("↩️ Undo", discord.ButtonStyle.secondary, f"undo_completion_{tid}")
+    async def callback(self,it): await self._handle(it,'accepted')
+
+
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user} has landed!')
+    logger.info(f"Bot is in {len(bot.guilds)} guilds")
+    
+    init_database()
+    
+    # 各ギルドで管理者ロールを作成/更新
+    for guild in bot.guilds:
+        logger.info(f"Setting up guild: {guild.name} (ID: {guild.id})")
+        await setup_roles(guild)
+    
+    # 定期タスク開始
+    try:
+        if not check_reminders.is_running():
+            check_reminders.start()
+            logger.info("Reminder task started successfully")
+        
+        if not heartbeat_check.is_running():
+            heartbeat_check.start()
+            logger.info("Heartbeat monitoring started")
+        
+        if not cleanup_memory.is_running():
+            cleanup_memory.start()
+            logger.info("Memory cleanup started")
+    except Exception as e:
+        logger.error(f"Failed to start tasks: {e}")
+
+@bot.event
+async def on_interaction(interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    
+    custom_id = interaction.data.get('custom_id')
+    if not custom_id:
+        return
+    
+    parts = custom_id.split('_')
+    if len(parts) < 3:
+        return
+    
+    action = '_'.join(parts[:-1])
+    try:
+        task_id = int(parts[-1])
+    except ValueError:
+        return
+    
+    if action not in ['accept_task', 'decline_task', 'complete_task', 'abandon_task', 'undo_completion']:
+        return
+    
+    try:
+        task_data = DatabaseManager.execute_query(
+            "SELECT assignee_id, instructor_id, status FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        
+        if not task_data:
+            await interaction.response.send_message("❌ タスクが見つかりません。", ephemeral=True)
+            return
+        
+        assignee_id, instructor_id, current_status = task_data[0]
+        
+        if interaction.user.id != assignee_id:
+            await interaction.response.send_message("❌ このタスクの担当者ではありません。", ephemeral=True)
+            return
+        
+        await handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status)
+        
+    except Exception as e:
+        logger.error(f"Error handling persistent interaction: {e}")
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ エラーが発生しました。", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ エラーが発生しました。", ephemeral=True)
+        except:
+            pass
+
+# ==== ASSIGN_FALLBACK_V2 (mention or "@name" accepted, with debug) ====
+import re as __re, sqlite3 as __sq, discord as __dd, datetime as __dt, asyncio as __aa
+
+@bot.event
+async def setup_hook():
+    @bot.listen("on_message")
+    async def __assign_fallback_v2(message: __dd.Message):
+        try:
+            if message.author.bot or (message.guild is None):
+                return
+
+            text = message.content.strip()
+
+            # 1) 「ボットが実際のメンション」 or 「@ボット名 で始まる」かを判定
+            is_real_mention = (bot.user in message.mentions)
+            name_variants = [
+                f"@{bot.user.display_name}",
+                f"@{bot.user.name}",
+            ]
+            starts_with_name = any(text.startswith(v) for v in name_variants)
+
+            if not (is_real_mention or starts_with_name):
+                return  # 他のメッセージは無視
+
+            # 2) 担当者を抽出（実メンションのみ採用）
+            assignees = [m for m in message.mentions if m.id != (bot.user.id if is_real_mention else 0)]
+            if not assignees:
+                await message.reply("❌ 指示対象のユーザーをメンションしてください。")
+                return
+
+            # 3) 先頭の @ボット or @ボット名 を取り除く
+            if is_real_mention:
+                text_wo_head = __re.sub(r'^<@!?%d>\s*' % bot.user.id, '', text).strip()
+            else:
+                # @リマインダくん / @Remind-kun など名前始まりを取り除く
+                head = next(v for v in name_variants if text.startswith(v))
+                text_wo_head = text[len(head):].strip()
+
+            # 4) メンション（<@...>）は本文から消してから、残りを「,」で分割
+            text_wo_mentions = __re.sub(r'<@!?[0-9]+>', '', text_wo_head).strip()
+
+            # 半角/全角カンマどちらでも最初のカンマを見つける
+            m1 = __re.search(r'[，,]', text_wo_mentions)
+            if not m1:
+                await message.reply("❌ 形式: `@bot @ユーザー, 期日, タスク名`（半角`,`を2つ）")
+                return
+
+            rest = text_wo_mentions[m1.end():].strip()
+            parts = [p.strip() for p in __re.split(r'[，,]', rest, maxsplit=1)]
+            if len(parts) < 2:
+                await message.reply("❌ 形式: `@bot @ユーザー, 期日, タスク名`")
+                return
+
+            due_str, task_name = parts[0], parts[1]
+            if not task_name:
+                await message.reply("❌ タスク名が空です。")
+                return
+
+            # 5) 期日パース（既存の parse_date を使用）
+            try:
+                due_dt = parse_date(due_str)
+            except Exception:
+                due_dt = None
+            if not due_dt:
+                await message.reply("❌ 期日が読めませんでした。例: 明日 18:00 / 3日後 / 金曜 14:30 / 2025/08/23 09:00")
+                return
+
+            # 6) 追加 & 個人CH通知（thread_id も保存）
+            created = 0
+            for target in assignees:
+                # DB INSERT（同一接続で lastrowid 取得）
+                try:
+                    conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
+                    cur.execute(
+                        "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (message.guild.id, message.author.id, target.id, task_name, due_dt, message.id, message.channel.id)
+                    )
+                    tid = cur.lastrowid
+                    conn.commit(); conn.close()
+                except Exception as e:
+                    try: conn.close()
+                    except: pass
+                    await message.reply(f"❌ {target.display_name}: DBエラー")
+                    continue
+
+                ch_name = f"to-{target.display_name}"
+                ch = __dd.utils.get(message.guild.channels, name=ch_name)
+                if not ch:
+                    try:
+                        ow = {
+                            message.guild.default_role: __dd.PermissionOverwrite(read_messages=False),
+                            target: __dd.PermissionOverwrite(read_messages=True, send_messages=True)
+                        }
+                        ch = await message.guild.create_text_channel(ch_name, overwrites=ow, topic=f"{target.display_name}の個人タスク管理チャンネル")
+                        intro = __dd.Embed(title="📋 個人タスクチャンネル",
+                                           description=f"こんにちは、{target.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                           color=__dd.Color.blue())
+                        await ch.send(embed=intro)
+                    except Exception:
+                        try: ch = await target.create_dm()
+                        except Exception: ch = None
+
+                if ch:
+                    emb = __dd.Embed(title=f"📋 {task_name}",
+                                     description=f"**期日: {due_dt.strftime('%Y/%m/%d %H:%M')}**",
+                                     color=__dd.Color.gold())
+                    try:
+                        view = TaskView(tid, target.id, message.author.id, "pending")
+                    except Exception:
+                        view = None
+
+                    try:
+                        main_msg = await ch.send(target.mention, embed=emb, view=view)
+                        try:
+                            th = await main_msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細")
+                            det = __dd.Embed(title="📋 タスク詳細", color=__dd.Color.blue())
+                            det.add_field(name="指示者", value=message.author.mention, inline=True)
+                            det.add_field(name="状態", value="🟥 未受託", inline=True)
+                            det.add_field(name="作成日時", value=__dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+                            if view is not None:
+                                await th.send(embed=det, view=TaskView(tid, target.id, message.author.id, "pending"))
+                            else:
+                                await th.send(embed=det)
+                            # 保存
+                            try:
+                                conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
+                                cur.execute("UPDATE tasks SET thread_id=?, message_id=? WHERE id=?", (th.id, main_msg.id, tid))
+                                conn.commit(); conn.close()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                created += 1
+
+            await message.reply(f"✅ {created}件のタスクを指示しました。" if created else "❌ 作成に失敗しました。")
+        except Exception as e:
+            try:
+                await message.reply(f"❌ 解析中エラー: {e}")
+            except Exception:
+                pass
+    logger.info("[assign] fallback_v2 installed via setup_hook")
+# ==== /ASSIGN_FALLBACK_V2 ====
+
+# ==== ASSIGN_FALLBACK_V2 (mention or "@name" accepted, with debug) ====
+import re as __re, sqlite3 as __sq, discord as __dd, datetime as __dt, asyncio as __aa
+
+@bot.event
+async def setup_hook():
+    @bot.listen("on_message")
+    async def __assign_fallback_v2(message: __dd.Message):
+        try:
+            if message.author.bot or (message.guild is None):
+                return
+
+            text = message.content.strip()
+
+            # 1) 「ボットが実際のメンション」 or 「@ボット名 で始まる」かを判定
+            is_real_mention = (bot.user in message.mentions)
+            name_variants = [
+                f"@{bot.user.display_name}",
+                f"@{bot.user.name}",
+            ]
+            starts_with_name = any(text.startswith(v) for v in name_variants)
+
+            if not (is_real_mention or starts_with_name):
+                return  # 他のメッセージは無視
+
+            # 2) 担当者を抽出（実メンションのみ採用）
+            assignees = [m for m in message.mentions if m.id != (bot.user.id if is_real_mention else 0)]
+            if not assignees:
+                await message.reply("❌ 指示対象のユーザーをメンションしてください。")
+                return
+
+            # 3) 先頭の @ボット or @ボット名 を取り除く
+            if is_real_mention:
+                text_wo_head = __re.sub(r'^<@!?%d>\s*' % bot.user.id, '', text).strip()
+            else:
+                # @リマインダくん / @Remind-kun など名前始まりを取り除く
+                head = next(v for v in name_variants if text.startswith(v))
+                text_wo_head = text[len(head):].strip()
+
+            # 4) メンション（<@...>）は本文から消してから、残りを「,」で分割
+            text_wo_mentions = __re.sub(r'<@!?[0-9]+>', '', text_wo_head).strip()
+
+            # 半角/全角カンマどちらでも最初のカンマを見つける
+            m1 = __re.search(r'[，,]', text_wo_mentions)
+            if not m1:
+                await message.reply("❌ 形式: `@bot @ユーザー, 期日, タスク名`（半角`,`を2つ）")
+                return
+
+            rest = text_wo_mentions[m1.end():].strip()
+            parts = [p.strip() for p in __re.split(r'[，,]', rest, maxsplit=1)]
+            if len(parts) < 2:
+                await message.reply("❌ 形式: `@bot @ユーザー, 期日, タスク名`")
+                return
+
+            due_str, task_name = parts[0], parts[1]
+            if not task_name:
+                await message.reply("❌ タスク名が空です。")
+                return
+
+            # 5) 期日パース（既存の parse_date を使用）
+            try:
+                due_dt = parse_date(due_str)
+            except Exception:
+                due_dt = None
+            if not due_dt:
+                await message.reply("❌ 期日が読めませんでした。例: 明日 18:00 / 3日後 / 金曜 14:30 / 2025/08/23 09:00")
+                return
+
+            # 6) 追加 & 個人CH通知（thread_id も保存）
+            created = 0
+            for target in assignees:
+                # DB INSERT（同一接続で lastrowid 取得）
+                try:
+                    conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
+                    cur.execute(
+                        "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (message.guild.id, message.author.id, target.id, task_name, due_dt, message.id, message.channel.id)
+                    )
+                    tid = cur.lastrowid
+                    conn.commit(); conn.close()
+                except Exception as e:
+                    try: conn.close()
+                    except: pass
+                    await message.reply(f"❌ {target.display_name}: DBエラー")
+                    continue
+
+                ch_name = f"to-{target.display_name}"
+                ch = __dd.utils.get(message.guild.channels, name=ch_name)
+                if not ch:
+                    try:
+                        ow = {
+                            message.guild.default_role: __dd.PermissionOverwrite(read_messages=False),
+                            target: __dd.PermissionOverwrite(read_messages=True, send_messages=True)
+                        }
+                        ch = await message.guild.create_text_channel(ch_name, overwrites=ow, topic=f"{target.display_name}の個人タスク管理チャンネル")
+                        intro = __dd.Embed(title="📋 個人タスクチャンネル",
+                                           description=f"こんにちは、{target.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                           color=__dd.Color.blue())
+                        await ch.send(embed=intro)
+                    except Exception:
+                        try: ch = await target.create_dm()
+                        except Exception: ch = None
+
+                if ch:
+                    emb = __dd.Embed(title=f"📋 {task_name}",
+                                     description=f"**期日: {due_dt.strftime('%Y/%m/%d %H:%M')}**",
+                                     color=__dd.Color.gold())
+                    try:
+                        view = TaskView(tid, target.id, message.author.id, "pending")
+                    except Exception:
+                        view = None
+
+                    try:
+                        main_msg = await ch.send(target.mention, embed=emb, view=view)
+                        try:
+                            th = await main_msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細")
+                            det = __dd.Embed(title="📋 タスク詳細", color=__dd.Color.blue())
+                            det.add_field(name="指示者", value=message.author.mention, inline=True)
+                            det.add_field(name="状態", value="🟥 未受託", inline=True)
+                            det.add_field(name="作成日時", value=__dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+                            if view is not None:
+                                await th.send(embed=det, view=TaskView(tid, target.id, message.author.id, "pending"))
+                            else:
+                                await th.send(embed=det)
+                            # 保存
+                            try:
+                                conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
+                                cur.execute("UPDATE tasks SET thread_id=?, message_id=? WHERE id=?", (th.id, main_msg.id, tid))
+                                conn.commit(); conn.close()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                created += 1
+
+            await message.reply(f"✅ {created}件のタスクを指示しました。" if created else "❌ 作成に失敗しました。")
+        except Exception as e:
+            try:
+                await message.reply(f"❌ 解析中エラー: {e}")
+            except Exception:
+                pass
+    logger.info("[assign] fallback_v2 installed via setup_hook")
+# ==== /ASSIGN_FALLBACK_V2 ====
+
+if __name__ == "__main__":
+    import os
+    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+    if not TOKEN:
+        logger.error("DISCORD_BOT_TOKEN environment variable not set")
+        exit(1)
+    
+    try:
+        logger.info("Bot starting...")
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        exit(1)
+# ---- Minimal DatabaseManager (fallback) ----
+class DatabaseManager:
+    @staticmethod
+    def execute_query(query: str, params: tuple = ()):
+        conn = sqlite3.connect('reminder_bot.db')
+        cur = conn.cursor()
+        try:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"DB error: {e}")
+            conn.rollback()
+            return []
+        finally:
+            conn.close()
+# -------------------------------------------
+# ==== INIT_DB_RESTORE ====
+def init_database():
+    import sqlite3
+    conn = sqlite3.connect('reminder_bot.db')
+    cur = conn.cursor()
+
+    # admins
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER,
+            guild_id INTEGER,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, guild_id)
+        )
+    """)
+
+    # instructors
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS instructors (
+            user_id INTEGER,
+            guild_id INTEGER,
+            target_users TEXT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, guild_id)
+        )
+    """)
+
+    # tasks（基本カラム＋あとで不足分をALTERで補完）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            instructor_id INTEGER,
+            assignee_id INTEGER,
+            task_name TEXT,
+            due_date TIMESTAMP,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_id INTEGER,
+            channel_id INTEGER,
+            reminder_sent INTEGER DEFAULT 0,
+            thread_id INTEGER
+        )
+    """)
+
+    # notification_channels
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            guild_id INTEGER,
+            user_id INTEGER,
+            channel_id INTEGER,
+            channel_type TEXT,
+            PRIMARY KEY (guild_id, user_id, channel_type)
+        )
+    """)
+
+    # 既存テーブルに不足カラムがあれば追加（失敗は無視）
+    try:
+        cur.execute("ALTER TABLE tasks ADD COLUMN reminder_sent INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE tasks ADD COLUMN thread_id INTEGER")
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+    try:
+        logger.info("[init] database ready")
+    except Exception:
+        pass
+# ==== /INIT_DB_RESTORE ====

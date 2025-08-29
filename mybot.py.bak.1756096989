@@ -1675,6 +1675,39 @@ async def __rename_min(thread: __dd.Thread, status: str):
     if new != cur:
         await thread.edit(name=new)
 
+@bot.command(name='紐付け', aliases=['bind'])
+async def bind_thread_command(ctx, task_id: int):
+    """（スレッド内）このスレッドを指定Task IDに紐付けて、色も即同期します"""
+    try:
+        if not isinstance(ctx.channel, __dd.Thread):
+            await ctx.reply("このコマンドは**スレッドの中**で実行してください。")
+            return
+
+        # DBに thread_id を保存
+        conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
+        cur.execute("UPDATE tasks SET thread_id=? WHERE id=?", (ctx.channel.id, task_id))
+        if cur.rowcount == 0:
+            conn.commit(); conn.close()
+            await ctx.reply(f"❌ Task ID {task_id} が見つかりません。")
+            return
+        conn.commit(); conn.close()
+
+        # 直ちに色を同期
+        status = await __helper_read_status_by_id(task_id)
+        try:
+            # 既にある helper があれば使う
+            if '_rename_thread_to_status' in globals():
+                await _rename_thread_to_status(ctx.channel, status)
+            else:
+                await __rename_min(ctx.channel, status)
+        except Exception:
+            await __rename_min(ctx.channel, status)
+
+        await ctx.reply(f"✅ 紐付け完了（Task ID {task_id} / status={status}）")
+    except Exception as e:
+        try: logger.error(f"[bind] error: {e}", exc_info=True)
+        except: pass
+        await ctx.reply("❌ 紐付け中にエラーが発生しました。")
 # ==== /BIND_THREAD_TO_TASK ====
 # ==== INIT_DB_AND_ROLES (日本語版/エラー安全) ====
 def init_database():

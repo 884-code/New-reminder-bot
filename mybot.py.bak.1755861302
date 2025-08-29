@@ -1,0 +1,2238 @@
+# -*- coding: utf-8 -*-
+# mybot.py (failsafe setup edition)
+import os, re, json, sqlite3, logging, asyncio
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")]
+)
+logger = logging.getLogger("taskbot")
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned_or("!", "！", "/"),
+    intents=intents,
+    case_insensitive=True,
+    help_command=None,
+    max_messages=100,
+)
+
+DB_PATH = "reminder_bot.db"
+def db_exec(q: str, params: tuple = (), fetch=False):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute(q, params); rows = cur.fetchall() if fetch else None
+    conn.commit(); conn.close(); return rows
+
+def init_db():
+    db_exec("""CREATE TABLE IF NOT EXISTS admins(user_id INTEGER, guild_id INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,guild_id))""")
+    db_exec("""CREATE TABLE IF NOT EXISTS instructors(user_id INTEGER, guild_id INTEGER, target_users TEXT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,guild_id))""")
+    db_exec("""CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, instructor_id INTEGER, assignee_id INTEGER,
+        task_name TEXT, due_date TIMESTAMP, status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        message_id INTEGER, channel_id INTEGER, reminder_sent INTEGER DEFAULT 0)""")
+    cols = db_exec("PRAGMA table_info(tasks)", fetch=True)
+    if "reminder_sent" not in [c[1] for c in cols]:
+        db_exec("ALTER TABLE tasks ADD COLUMN reminder_sent INTEGER DEFAULT 0")
+
+def is_admin(uid:int,gid:int)->bool: return bool(db_exec("SELECT 1 FROM admins WHERE user_id=? AND guild_id=?", (uid,gid), fetch=True))
+def is_instructor(uid:int,gid:int)->bool: return bool(db_exec("SELECT 1 FROM instructors WHERE user_id=? AND guild_id=?", (uid,gid), fetch=True))
+
+def insert_task(gid:int,iid:int,aid:int,name:str,due:datetime)->int:
+    db_exec("INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date) VALUES (?,?,?,?,?)", (gid,iid,aid,name,due))
+    return db_exec("SELECT last_insert_rowid()", fetch=True)[0][0]
+
+def get_task(tid:int):
+    r=db_exec("SELECT * FROM tasks WHERE id=?", (tid,), fetch=True)
+    return r[0] if r else None
+
+async def ensure_mgmt(guild:discord.Guild)->Optional[discord.TextChannel]:
+    for name in ("task-management","タスク管理"):
+        ch = discord.utils.get(guild.channels, name=name)
+        if isinstance(ch, discord.TextChannel): return ch
+    try:
+        return await guild.create_text_channel("task-management", overwrites={guild.default_role: discord.PermissionOverwrite(read_messages=False)})
+    except Exception as e:
+        logger.error(f"mgmt create failed: {e}"); return None
+
+async def ensure_personal(guild:discord.Guild,user:discord.Member)->Optional[discord.TextChannel]:
+    name=f"to-{user.display_name}".lower().replace(" ","-")
+    ch=discord.utils.get(guild.channels,name=name)
+    if isinstance(ch,discord.TextChannel): return ch
+    try:
+        ow={guild.default_role: discord.PermissionOverwrite(read_messages=False), user: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
+        return await guild.create_text_channel(name=name, overwrites=ow, topic=f"{user.display_name} の個人タスク")
+    except Exception as e:
+        logger.error(f"personal create failed: {e}"); return None
+
+def parse_date(s:str)->Optional[datetime]:
+    now=datetime.now(); t=s.strip().lower()
+    m=re.search(r'(\d{1,2}):(\d{2})$',t)
+    if m: hour,minute=int(m.group(1)),int(m.group(2)); t=t[:m.start()].strip()
+    else: hour,minute=23,59
+    pats=[(r'^(今日|today)$',lambda m:now),(r'^(明日|tomorrow)$',lambda m:now+timedelta(days=1)),
+          (r'^(明後日|day after tomorrow)$',lambda m:now+timedelta(days=2)),(r'^(昨日|yesterday)$',lambda m:now-timedelta(days=1)),
+          (r'^(\d+)\s*(日後|days?)$',lambda m:now+timedelta(days=int(m.group(1)))),
+          (r'^(\d+)\s*(週間後|weeks?)$',lambda m:now+timedelta(weeks=int(m.group(1)))),
+          (r'^(\d+)\s*(時間後|hours?)$',lambda m:now+timedelta(hours=int(m.group(1)))),
+          (r'^(\d+)\s*(分後|mins?|minutes?)$',lambda m:now+timedelta(minutes=int(m.group(1)))) ]
+    for pat,fn in pats:
+        mm=re.match(pat,t)
+        if mm: dt=fn(mm); return dt.replace(hour=hour,minute=minute,second=0,microsecond=0)
+    wk={'月':0,'火':1,'水':2,'木':3,'金':4,'土':5,'日':6,'monday':0,'tuesday':1,'wednesday':2,'thursday':3,'friday':4,'saturday':5,'sunday':6,'mon':0,'tue':1,'wed':2,'thu':3,'fri':4,'sat':5,'sun':6}
+    for name,num in wk.items():
+        if name in t:
+            d=num-now.weekday(); d+=7 if d<=0 else 0
+            return (now+timedelta(days=d)).replace(hour=hour,minute=minute,second=0,microsecond=0)
+    abs_p=[r'^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$',r'^(\d{1,2})[/-](\d{1,2})$',r'^(\d{4})年(\d{1,2})月(\d{1,2})日$',r'^(\d{1,2})月(\d{1,2})日$']
+    for pat in abs_p:
+        mm=re.match(pat,t)
+        if mm:
+            g=mm.groups()
+            if len(g)==3 and len(g[0])==4: y,mo,d=int(g[0]),int(g[1]),int(g[2])
+            elif len(g)==3: mo,d,y=int(g[0]),int(g[1]),now.year
+            else: mo,d,y=int(g[0]),int(g[1]),now.year
+            try: return datetime(y,mo,d,hour,minute)
+            except ValueError: return None
+    return None
+
+STATUS_COLORS={'pending':discord.Color.red(),'accepted':discord.Color.gold(),'completed':discord.Color.green(),'declined':discord.Color.dark_gray(),'abandoned':discord.Color.dark_red()}
+STATUS_EMOJI={'pending':'🟥','accepted':'🟨','completed':'🟩','declined':'⚪','abandoned':'🟫'}
+STATUS_NAME={'pending':'Pending','accepted':'In Progress','completed':'Completed','declined':'Declined','abandoned':'Problem'}
+
+def build_embed(trow,status:Optional[str]=None)->discord.Embed:
+    st=status or trow[6]
+    try: due_ts=int(datetime.fromisoformat(str(trow[5])).timestamp())
+    except Exception: due_ts=int(datetime.strptime(str(trow[5]),"%Y-%m-%d %H:%M:%S").timestamp())
+    emb=discord.Embed(title=f"📋 {trow[4]}", color=STATUS_COLORS.get(st, discord.Color.blurple()))
+    emb.add_field(name="Due Date", value=f"<t:{due_ts}:F>", inline=True)
+    emb.add_field(name="Status", value=f"{STATUS_EMOJI.get(st,'⚪')} {STATUS_NAME.get(st,st)}", inline=True)
+    emb.add_field(name="Updated", value=f"<t:{int(datetime.now().timestamp())}:R>", inline=True)
+    emb.set_footer(text=f"Task ID: {trow[0]}"); return emb
+
+class TaskView(discord.ui.View):
+    def __init__(self, tid:int, aid:int, iid:int, status:str):
+        super().__init__(timeout=None); self.tid, self.aid, self.iid, self.status=tid,aid,iid,status; self._setup()
+    def _setup(self):
+        self.clear_items()
+        if self.status=='pending': self.add_item(AcceptButton(self.tid)); self.add_item(DeclineButton(self.tid))
+        elif self.status=='accepted': self.add_item(CompleteButton(self.tid)); self.add_item(AbandonButton(self.tid))
+        elif self.status=='completed': self.add_item(UndoButton(self.tid))
+
+class _BaseBtn(discord.ui.Button):
+    def __init__(self,label,style,cid): super().__init__(label=label, style=style, custom_id=cid)
+    async def _handle(self,it:discord.Interaction,new_status:str):
+        t=db_exec("SELECT * FROM tasks WHERE id=?", (int(self.custom_id.split('_')[-1]),), fetch=True)
+        if not t: await it.response.send_message("❌ Task not found.", ephemeral=True); return
+        t=t[0]
+        if it.user.id!=t[3]: await it.response.send_message("❌ You are not the assignee.", ephemeral=True); return
+        db_exec("UPDATE tasks SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status,t[0]))
+        t2=db_exec("SELECT * FROM tasks WHERE id=?", (t[0],), fetch=True)[0]
+        await it.response.edit_message(embed=build_embed(t2,new_status), view=TaskView(t2[0],t2[3],t2[2],new_status))
+
+class AcceptButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("✅ Accept", discord.ButtonStyle.success, f"accept_task_{tid}")
+    async def callback(self,it): await self._handle(it,'accepted')
+class DeclineButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("❌ Decline", discord.ButtonStyle.danger, f"decline_task_{tid}")
+    async def callback(self,it): await self._handle(it,'declined')
+class CompleteButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("📝 Complete", discord.ButtonStyle.success, f"complete_task_{tid}")
+    async def callback(self,it): await self._handle(it,'completed')
+class AbandonButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("⚠️ Problem", discord.ButtonStyle.danger, f"abandon_task_{tid}")
+    async def callback(self,it): await self._handle(it,'abandoned')
+class UndoButton(_BaseBtn):
+    def __init__(self,tid:int): super().__init__("↩️ Undo", discord.ButtonStyle.secondary, f"undo_completion_{tid}")
+    async def callback(self,it): await self._handle(it,'accepted')
+
+@bot.event
+async def on_ready():
+    logger.info(f"{bot.user} logged in. Guilds={len(bot.guilds)}"); init_db()
+    try: logger.info("Text commands: %s", ", ".join(sorted(c.name for c in bot.commands)))
+    except Exception: pass
+    try:
+        for g in bot.guilds: await bot.tree.sync(guild=g)
+        logger.info("Slash commands synced.")
+    except Exception as e: logger.error(f"Slash sync error: {e}")
+
+@bot.event
+async def on_message(message:discord.Message):
+    if message.author.bot: return
+    text=message.content.strip()
+    if re.match(rf"^(?:<@!?{bot.user.id}>\s*)?[/!！]?\s*setup\b", text, flags=re.I):
+        ctx=await bot.get_context(message); await setup_cmd(ctx); return
+    await bot.process_commands(message)
+
+@bot.command(name="setup", aliases=["init","セットアップ"])
+async def setup_cmd(ctx:commands.Context):
+    if not ctx.guild: await ctx.reply("❌ サーバー内で実行してください"); return
+    db_exec("INSERT OR IGNORE INTO admins(user_id,guild_id) VALUES(?,?)", (ctx.author.id, ctx.guild.id))
+    await ctx.reply("✅ Setup complete. Use `!channels` → `!test`")
+
+@bot.command(name="channels")
+async def channels_cmd(ctx:commands.Context):
+    if not ctx.guild: return
+    if not is_admin(ctx.author.id, ctx.guild.id): await ctx.reply("❌ Admin only"); return
+    created=[]
+    mg=await ensure_mgmt(ctx.guild); 
+    if mg: created.append(mg.name)
+    cnt=0
+    for m in ctx.guild.members:
+        if m.bot: continue
+        if cnt>=10: break
+        ch=await ensure_personal(ctx.guild, m)
+        if ch: created.append(ch.name); cnt+=1
+        await asyncio.sleep(0.3)
+    await ctx.reply("✅ Channels: " + (", ".join(created) if created else "(none)"))
+
+@bot.command(name="test")
+async def test_cmd(ctx:commands.Context):
+    if not ctx.guild: return
+    due=datetime.now()+timedelta(hours=1, minutes=5)
+    tid=insert_task(ctx.guild.id, ctx.author.id, ctx.author.id, "Test Task / テストタスク", due)
+    task=get_task(tid); ch=await ensure_personal(ctx.guild, ctx.author)
+    view=TaskView(tid, ctx.author.id, ctx.author.id, 'pending')
+    if ch: await ch.send(ctx.author.mention, embed=build_embed(task), view=view)
+    else:
+        try: await ctx.author.send(embed=build_embed(task), view=view)
+        except: pass
+    await ctx.reply(f"✅ Test created (ID={tid})")
+
+@bot.command(name="ping")
+async def ping_cmd(ctx:commands.Context): await ctx.reply("pong")
+
+@bot.tree.command(name="setup", description="Initial setup / 初期セットアップ")
+async def setup_slash(it:discord.Interaction):
+    if not it.guild_id: await it.response.send_message("❌ サーバー内で実行してください", ephemeral=True); return
+    db_exec("INSERT OR IGNORE INTO admins(user_id,guild_id) VALUES(?,?)", (it.user.id, it.guild_id))
+    await it.response.send_message("✅ Setup complete. Run `/channels` or `!channels` next.", ephemeral=True)
+
+@bot.tree.command(name="channels", description="Create task channels")
+async def channels_slash(it:discord.Interaction):
+    if not it.guild: await it.response.send_message("❌ サーバー内で実行してください", ephemeral=True); return
+    if not is_admin(it.user.id, it.guild.id): await it.response.send_message("❌ Admin only", ephemeral=True); return
+    await it.response.send_message("✅ OK (use `!channels` too)", ephemeral=True)
+
+@tasks.loop(minutes=5)
+async def check_reminders():
+    now=datetime.now(); soon=now+timedelta(hours=1)
+    rows=db_exec("SELECT id,guild_id,assignee_id,task_name,due_date FROM tasks WHERE status='accepted' AND reminder_sent=0 AND due_date>? AND due_date<=?", (now,soon), fetch=True)
+    for tid,gid,aid,tname,due in rows:
+        guild=bot.get_guild(gid); 
+        if not guild: continue
+        user=guild.get_member(aid)
+        if not user: continue
+        try:
+            try: due_ts=int(datetime.fromisoformat(str(due)).timestamp())
+            except Exception: due_ts=int(datetime.strptime(str(due), "%Y-%m-%d %H:%M:%S").timestamp())
+            emb=discord.Embed(title="⏰ Task Reminder", description=f"**{tname}**\nDue in less than 1 hour!", color=discord.Color.orange())
+            emb.add_field(name="Due", value=f"<t:{due_ts}:F>", inline=True)
+            try: await user.send(embed=emb)
+            except Exception:
+                ch=await ensure_personal(guild,user)
+                if ch: await ch.send(user.mention, embed=emb)
+            db_exec("UPDATE tasks SET reminder_sent=1 WHERE id=?", (tid,))
+        except Exception as e:
+            logging.error(f"reminder failed: {e}"); db_exec("UPDATE tasks SET reminder_sent=1 WHERE id=?", (tid,))
+
+@check_reminders.before_loop
+async def _b1(): await bot.wait_until_ready()
+@tasks.loop(minutes=1)
+async def heartbeat_check():
+    try:
+        if heartbeat_check.current_loop % 5 == 0:
+            logger.info(f"Heartbeat OK. Guilds={len(bot.guilds)} Latency={round(bot.latency*1000)}ms")
+    except Exception as e: logger.error(f"Heartbeat error: {e}")
+@heartbeat_check.before_loop
+async def _b2(): await bot.wait_until_ready()
+@tasks.loop(hours=1)
+async def cleanup_memory():
+    try:
+        if hasattr(bot,"_connection") and hasattr(bot._connection,"_messages"): bot._connection._messages.clear()
+        logger.info("Memory cleanup done.")
+    except Exception as e: logger.error(f"cleanup error: {e}")
+@cleanup_memory.before_loop
+async def _b3(): await bot.wait_until_ready()
+
+@bot.event
+async def on_command_error(ctx:commands.Context, error:Exception):
+    if isinstance(error, commands.CommandNotFound):
+        text=ctx.message.content.strip()
+        if re.match(r"^[/!！]?\s*setup\b", text, flags=re.I):
+            await setup_cmd(ctx); return
+        return
+    logging.error(f"Command error: {error}", exc_info=True)
+    try: await ctx.reply("❌ An error occurred.")
+    except: pass
+
+# ==== HOTFIX (pre-run safe overrides) ====
+import sqlite3 as _sqlite3
+import datetime as _dt
+import discord as _discord
+
+def __fx_add_task(guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id):
+    conn = _sqlite3.connect('reminder_bot.db')
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id)
+    )
+    tid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    logger.info(f"[HOTFIX] add_task inserted id={tid}, assignee={assignee_id}, name={task_name}")
+    return tid
+
+try:
+    DatabaseManager.add_task = staticmethod(__fx_add_task)
+except Exception:
+    pass
+
+async def __fx_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id: int=None):
+    try:
+        if task_id is None:
+            row = DatabaseManager.execute_query(
+                "SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (guild.id, assignee.id, task_name)
+            )
+            if not row:
+                logger.error("[HOTFIX] task_id lookup failed (no row)"); return
+            task_id = row[0][0]
+        logger.info(f"[HOTFIX] send_task_notification start task_id={task_id}, assignee={assignee.id}")
+
+        ch = _discord.utils.get(guild.channels, name=f"to-{assignee.display_name}")
+        if not ch:
+            try:
+                ow = {guild.default_role: _discord.PermissionOverwrite(read_messages=False),
+                      assignee: _discord.PermissionOverwrite(read_messages=True, send_messages=True)}
+                ch = await guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro = _discord.Embed(title="📋 個人タスクチャンネル",
+                                       description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                       color=_discord.Color.blue())
+                await ch.send(embed=intro)
+            except Exception as e:
+                try:
+                    ch = await assignee.create_dm()
+                except:
+                    logger.error(f"[HOTFIX] cannot create channel/DM: {e}")
+                    return
+
+        embed = _discord.Embed(title=f"📋 {task_name}",
+                               description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
+                               color=_discord.Color.gold())
+        view = TaskView(task_id, assignee.id, instructor.id, "pending")
+        msg = await ch.send(assignee.mention, embed=embed, view=view)
+
+        try:
+            th = await msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+            detail = _discord.Embed(title="📋 タスク詳細", color=_discord.Color.blue())
+            detail.add_field(name="指示者", value=instructor.mention, inline=True)
+            detail.add_field(name="状態", value="🟥 未受託", inline=True)
+            detail.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+            await th.send(embed=detail, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+        except Exception as e:
+            logger.warning(f"[HOTFIX] thread create failed: {e}")
+    except Exception as e:
+        logger.error(f"[HOTFIX] send_task_notification error: {e}", exc_info=True)
+
+send_task_notification = __fx_send_task_notification
+
+try:
+    bot.remove_command('test'); bot.remove_command('テスト')
+except Exception:
+    pass
+
+@bot.command(name='テスト', aliases=['test'])
+async def __fx_test(ctx):
+    try:
+        logger.info("[HOTFIX] __fx_test invoked by %s in guild %s", ctx.author.id, ctx.guild.id)
+        due = _dt.datetime.now() + _dt.timedelta(days=1)
+        due = due.replace(hour=23, minute=59, second=0, microsecond=0)
+        task_id = DatabaseManager.add_task(
+            guild_id=ctx.guild.id,
+            instructor_id=ctx.author.id,
+            assignee_id=ctx.author.id,
+            task_name="テストタスク",
+            due_date=due,
+            message_id=ctx.message.id,
+            channel_id=ctx.channel.id
+        )
+        if not DatabaseManager.execute_query("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
+            await ctx.send("❌ タスク作成に失敗しました。（直後確認NG）"); return
+        await send_task_notification(ctx.guild, ctx.author, ctx.author, "テストタスク", due, ctx.message.id, task_id=task_id)
+        ok = _discord.Embed(title="🧪 テストタスク作成", description="タスク作成機能のテストが成功しました！", color=_discord.Color.green())
+        ok.add_field(name="タスクID", value=str(task_id), inline=True)
+        ok.add_field(name="期日", value=due.strftime("%Y/%m/%d %H:%M"), inline=True)
+        await ctx.send(embed=ok)
+    except Exception as e:
+        logger.error(f"[HOTFIX] __fx_test error: {e}", exc_info=True)
+        await ctx.send("❌ テスト中にエラーが発生しました。")
+# ==== /HOTFIX (pre-run) ====
+
+# ==== FIX_BLOCK (pre-run, self-contained test & notify) ====
+import sqlite3 as __sq, datetime as __dt, discord as __dd
+
+def __fix_db_add_task(gid, iid, aid, name, due, mid, cid):
+    conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
+    cur.execute("INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) VALUES (?,?,?,?,?,?,?)",
+                (gid, iid, aid, name, due, mid, cid))
+    tid = cur.lastrowid
+    conn.commit(); conn.close()
+    return tid
+
+async def __fix_notify_personal(guild, assignee, instructor, name, due, task_id):
+    ch = __dd.utils.get(guild.channels, name=f"to-{assignee.display_name}")
+    if not ch:
+        try:
+            ow = {guild.default_role: __dd.PermissionOverwrite(read_messages=False),
+                  assignee: __dd.PermissionOverwrite(read_messages=True, send_messages=True)}
+            ch = await guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+            intro = __dd.Embed(title="📋 個人タスクチャンネル",
+                               description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                               color=__dd.Color.blue())
+            await ch.send(embed=intro)
+        except Exception:
+            try:
+                ch = await assignee.create_dm()
+            except:
+                return
+
+    emb = __dd.Embed(title=f"📋 {name}", description=f"**期日: {due.strftime('%Y/%m/%d %H:%M')}**", color=__dd.Color.gold())
+    view = TaskView(task_id, assignee.id, instructor.id, "pending")
+    msg = await ch.send(assignee.mention, embed=emb, view=view)
+    try:
+        th = await msg.create_thread(name=f"🟥 {name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+        d = __dd.Embed(title="📋 タスク詳細", color=__dd.Color.blue())
+        d.add_field(name="指示者", value=instructor.mention, inline=True)
+        d.add_field(name="状態", value="🟥 未受託", inline=True)
+        d.add_field(name="作成日時", value=__dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+        await th.send(embed=d, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+    except Exception:
+        pass
+
+try:
+    bot.remove_command('test'); bot.remove_command('テスト')
+except Exception:
+    pass
+
+@bot.command(name='テスト', aliases=['test'])
+async def __fix_test(ctx):
+    try:
+        due = __dt.datetime.now() + __dt.timedelta(days=1)
+        due = due.replace(hour=23, minute=59, second=0, microsecond=0)
+        tid = __fix_db_add_task(ctx.guild.id, ctx.author.id, ctx.author.id, "テストタスク", due, ctx.message.id, ctx.channel.id)
+        await __fix_notify_personal(ctx.guild, ctx.author, ctx.author, "テストタスク", due, tid)
+        ok = __dd.Embed(title="🧪 テストタスク作成", description="タスク作成機能のテストが成功しました！", color=__dd.Color.green())
+        ok.add_field(name="タスクID", value=str(tid), inline=True)
+        ok.add_field(name="期日", value=due.strftime('%Y/%m/%d %H:%M'), inline=True)
+        await ctx.send(embed=ok)
+    except Exception as e:
+        logger.error(f"[FIX_BLOCK] test error: {e}", exc_info=True)
+        await ctx.send("❌ テスト中にエラーが発生しました。")
+# ==== /FIX_BLOCK ====
+
+
+
+
+
+
+# ==== LINK_RENAME (handle_task_action内で強制連動) ====
+import sqlite3 as _sq, discord as _dd, asyncio as _aio, re as _re
+
+def _link_emoji(status):
+    return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(status,"⚪")
+
+def _link_desired(action):
+    return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+            "abandon_task":"abandoned","decline_task":"declined"}.get(action)
+
+async def _link_find_or_save_thread(interaction, task_id, task_name):
+    # 1) DBに thread_id があればそれを使う
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("SELECT thread_id FROM tasks WHERE id=?", (task_id,))
+        row=c.fetchone(); c.connection.close()
+    except Exception: row=None
+    th=None
+    if row and row[0]:
+        th = interaction.client.get_channel(row[0])
+        if not isinstance(th,_dd.Thread):
+            try: th = await interaction.client.fetch_channel(row[0])
+            except Exception: th=None
+        if isinstance(th,_dd.Thread):
+            return th
+
+    # 2) 文脈から特定（スレッド内→channel、親→message.thread、なければ親chのthreads）
+    msg=interaction.message
+    th = msg.channel if isinstance(msg.channel,_dd.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_dd.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+
+    # 3) 見つかったらDBに保存
+    if isinstance(th,_dd.Thread):
+        try:
+            conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
+            cur.execute("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+            conn.commit(); conn.close()
+        except Exception: pass
+    return th
+
+# 既存の handle_task_action を上書き：元の処理→連動リネームの順で実施
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    # 1) まず元の処理を実行（ステータス更新・Embed切替など）
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    # 2) アクション→目標ステータス
+    desired = _link_desired(action)
+    if not desired: 
+        return
+
+    # 3) タスク名を取得（Embedタイトル or DB）
+    task_name = None
+    try:
+        if interaction.message.embeds:
+            title = (interaction.message.embeds[0].title or "").strip()
+            task_name = title[2:].strip() if title.startswith("📋") else title
+    except Exception:
+        task_name=None
+    if not task_name:
+        try:
+            c=_sq.connect('reminder_bot.db').cursor()
+            c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close()
+            task_name = r[0] if r else None
+        except Exception:
+            task_name=None
+
+    # 4) 対象スレッドを特定（必要なら保存）
+    th = await _link_find_or_save_thread(interaction, task_id, task_name)
+    if not isinstance(th,_dd.Thread):
+        # 少し遅延後にもう一度（作成直後の競合回避）
+        await _aio.sleep(0.25)
+        th = await _link_find_or_save_thread(interaction, task_id, task_name)
+        if not isinstance(th,_dd.Thread):
+            return
+
+    # 5) 権限チェック
+    me = interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p = th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+            return
+
+    # 6) スレッド名の先頭絵文字を差し替え（🟥/🟨/🟩/⚠️/❌）
+    cur = th.name or ""
+    em  = _link_emoji(desired)
+    for e in ["🟥","🟨","🟩","⚠️","❌","⚪"]:
+        if cur.startswith(e):
+            new = em + cur[len(e):]
+            break
+    else:
+        new = f"{em} {cur}"
+    new=new.lstrip()
+
+    if new != cur:
+        await th.edit(name=new)
+        logger.info(f"[link-rename] '{cur}' -> '{new}' (action={action}, id={task_id})")
+    else:
+        logger.info(f"[link-rename] no change: '{cur}' (action={action})")
+# ==== /LINK_RENAME ====
+
+# ==== MIN_SEND_NOTIFY (save thread_id; no TaskID in embeds) ====
+import sqlite3 as _sq, datetime as _dt, discord as _dd
+
+def _db_exec(sql, params=(), fetch=False):
+    conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params)
+    rows=cur.fetchall() if fetch else None
+    conn.commit(); conn.close()
+    return rows
+
+# tasks.thread_id が無ければ追加
+try:
+    cols={c[1] for c in _db_exec("PRAGMA table_info(tasks)", fetch=True)}
+    if 'thread_id' not in cols:
+        _db_exec("ALTER TABLE tasks ADD COLUMN thread_id INTEGER")
+        logger.info("[min] added thread_id")
+except Exception as e:
+    logger.error(f"[min] migration: {e}", exc_info=True)
+
+async def _min_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id:int=None):
+    try:
+        if task_id is None:
+            row=_db_exec("SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? ORDER BY created_at DESC LIMIT 1",
+                         (guild.id, assignee.id, task_name), fetch=True)
+            if not row: return
+            task_id=row[0][0]
+
+        ch=_dd.utils.get(guild.channels, name=f"to-{assignee.display_name}")
+        if not ch:
+            try:
+                ow={guild.default_role:_dd.PermissionOverwrite(read_messages=False),
+                    assignee:_dd.PermissionOverwrite(read_messages=True, send_messages=True)}
+                ch=await guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro=_dd.Embed(title="📋 個人タスクチャンネル",
+                                description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                color=_dd.Color.blue())
+                await ch.send(embed=intro)
+            except Exception:
+                try: ch=await assignee.create_dm()
+                except: return
+
+        emb=_dd.Embed(title=f"📋 {task_name}",
+                      description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
+                      color=_dd.Color.gold())
+        view=TaskView(task_id, assignee.id, instructor.id, "pending")
+        main=await ch.send(assignee.mention, embed=emb, view=view)
+
+        th=await main.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+        det=_dd.Embed(title="📋 タスク詳細", color=_dd.Color.blue())
+        det.add_field(name="指示者", value=instructor.mention, inline=True)
+        det.add_field(name="状態", value="🟥 未受託", inline=True)
+        det.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+        await th.send(embed=det, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+
+        _db_exec("UPDATE tasks SET thread_id=?, message_id=? WHERE id=?", (th.id, main.id, task_id))
+        logger.info(f"[min] saved thread_id={th.id}, message_id={main.id} task={task_id}")
+    except Exception as e:
+        logger.error(f"[min] send_task_notification: {e}", exc_info=True)
+
+send_task_notification=_min_send_task_notification
+# ==== /MIN_SEND_NOTIFY ====
+
+# ==== LINK_HANDLE (single place to rename in handle_task_action) ====
+import discord as _ddd, sqlite3 as _ss, asyncio as _aa
+
+def _emoji(st): return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+def _desired(act): return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+                           "abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def _find_or_save_thread(interaction, task_id, task_name):
+    th = interaction.message.channel if isinstance(interaction.message.channel,_ddd.Thread) else getattr(interaction.message,"thread",None)
+    if isinstance(th,_ddd.Thread): 
+        try:
+            c=_ss.connect('reminder_bot.db').cursor(); c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+            c.connection.commit(); c.connection.close()
+        except Exception: pass
+        return th
+    try:
+        for t in getattr(interaction.message.channel,"threads",[]):
+            if task_name and task_name in (t.name or ""): 
+                try:
+                    c=_ss.connect('reminder_bot.db').cursor(); c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (t.id, task_id))
+                    c.connection.commit(); c.connection.close()
+                except Exception: pass
+                return t
+    except Exception: pass
+    return None
+
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    target=_desired(action)
+    if not target: return
+
+    # タスク名（Embed or DB）
+    tname=None
+    try:
+        if interaction.message.embeds:
+            title=(interaction.message.embeds[0].title or "").strip()
+            tname = title[2:].strip() if title.startswith("📋") else title
+    except Exception: pass
+    if not tname:
+        try:
+            c=_ss.connect('reminder_bot.db').cursor(); c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close()
+            tname=r[0] if r else None
+        except Exception: pass
+
+    th=_find_or_save_thread(interaction, task_id, tname)
+    if not isinstance(th,_ddd.Thread):
+        await _aa.sleep(0.25)
+        th=_find_or_save_thread(interaction, task_id, tname)
+        if not isinstance(th,_ddd.Thread): return
+
+    me=interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p=th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+            return
+
+    cur=th.name or ""
+    em=_emoji(target)
+    for e in ["🟥","🟨","🟩","⚠️","❌","⚪"]:
+        if cur.startswith(e):
+            new = em + cur[len(e):]; break
+    else:
+        new = f"{em} {cur}"
+    new=new.lstrip()
+
+    if new != cur:
+        await th.edit(name=new)
+        logger.info(f"[link] '{cur}' -> '{new}' (action={action}, id={task_id})")
+    else:
+        logger.info(f"[link] no change: '{cur}' (action={action})")
+# ==== /LINK_HANDLE ====
+
+# ==== MIN_SEND_NOTIFY (save thread_id; no TaskID in embeds) ====
+import sqlite3 as _sq, datetime as _dt, discord as _dd
+
+def _db_exec(sql, params=(), fetch=False):
+    conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params)
+    rows=cur.fetchall() if fetch else None
+    conn.commit(); conn.close()
+    return rows
+
+# tasks.thread_id が無ければ追加
+try:
+    cols={c[1] for c in _db_exec("PRAGMA table_info(tasks)", fetch=True)}
+    if 'thread_id' not in cols:
+        _db_exec("ALTER TABLE tasks ADD COLUMN thread_id INTEGER")
+        logger.info("[min] added thread_id")
+except Exception as e:
+    logger.error(f"[min] migration: {e}", exc_info=True)
+
+async def _min_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id:int=None):
+    try:
+        if task_id is None:
+            row=_db_exec("SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? ORDER BY created_at DESC LIMIT 1",
+                         (guild.id, assignee.id, task_name), fetch=True)
+            if not row: return
+            task_id=row[0][0]
+
+        ch=_dd.utils.get(guild.channels, name=f"to-{assignee.display_name}")
+        if not ch:
+            try:
+                ow={guild.default_role:_dd.PermissionOverwrite(read_messages=False),
+                    assignee:_dd.PermissionOverwrite(read_messages=True, send_messages=True)}
+                ch=await guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro=_dd.Embed(title="📋 個人タスクチャンネル",
+                                description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                color=_dd.Color.blue())
+                await ch.send(embed=intro)
+            except Exception:
+                try: ch=await assignee.create_dm()
+                except: return
+
+        emb=_dd.Embed(title=f"📋 {task_name}",
+                      description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
+                      color=_dd.Color.gold())
+        view=TaskView(task_id, assignee.id, instructor.id, "pending")
+        main=await ch.send(assignee.mention, embed=emb, view=view)
+
+        th=await main.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+        det=_dd.Embed(title="📋 タスク詳細", color=_dd.Color.blue())
+        det.add_field(name="指示者", value=instructor.mention, inline=True)
+        det.add_field(name="状態", value="🟥 未受託", inline=True)
+        det.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+        await th.send(embed=det, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+
+        _db_exec("UPDATE tasks SET thread_id=?, message_id=? WHERE id=?", (th.id, main.id, task_id))
+        logger.info(f"[min] saved thread_id={th.id}, message_id={main.id} task={task_id}")
+    except Exception as e:
+        logger.error(f"[min] send_task_notification: {e}", exc_info=True)
+
+send_task_notification=_min_send_task_notification
+# ==== /MIN_SEND_NOTIFY ====
+
+# ==== LINK_HANDLE (single place to rename in handle_task_action) ====
+import discord as _ddd, sqlite3 as _ss, asyncio as _aa
+
+def _emoji(st): return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+def _desired(act): return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+                           "abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def _find_or_save_thread(interaction, task_id, task_name):
+    th = interaction.message.channel if isinstance(interaction.message.channel,_ddd.Thread) else getattr(interaction.message,"thread",None)
+    if isinstance(th,_ddd.Thread): 
+        try:
+            c=_ss.connect('reminder_bot.db').cursor(); c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+            c.connection.commit(); c.connection.close()
+        except Exception: pass
+        return th
+    try:
+        for t in getattr(interaction.message.channel,"threads",[]):
+            if task_name and task_name in (t.name or ""): 
+                try:
+                    c=_ss.connect('reminder_bot.db').cursor(); c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (t.id, task_id))
+                    c.connection.commit(); c.connection.close()
+                except Exception: pass
+                return t
+    except Exception: pass
+    return None
+
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    target=_desired(action)
+    if not target: return
+
+    # タスク名（Embed or DB）
+    tname=None
+    try:
+        if interaction.message.embeds:
+            title=(interaction.message.embeds[0].title or "").strip()
+            tname = title[2:].strip() if title.startswith("📋") else title
+    except Exception: pass
+    if not tname:
+        try:
+            c=_ss.connect('reminder_bot.db').cursor(); c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close()
+            tname=r[0] if r else None
+        except Exception: pass
+
+    th=_find_or_save_thread(interaction, task_id, tname)
+    if not isinstance(th,_ddd.Thread):
+        await _aa.sleep(0.25)
+        th=_find_or_save_thread(interaction, task_id, tname)
+        if not isinstance(th,_ddd.Thread): return
+
+    me=interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p=th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+            return
+
+    cur=th.name or ""
+    em=_emoji(target)
+    for e in ["🟥","🟨","🟩","⚠️","❌","⚪"]:
+        if cur.startswith(e):
+            new = em + cur[len(e):]; break
+    else:
+        new = f"{em} {cur}"
+    new=new.lstrip()
+
+    if new != cur:
+        await th.edit(name=new)
+        logger.info(f"[link] '{cur}' -> '{new}' (action={action}, id={task_id})")
+    else:
+        logger.info(f"[link] no change: '{cur}' (action={action})")
+# ==== /LINK_HANDLE ====
+
+# ==== CANONICAL_RENAME (single-source & debounce) ====
+import discord as _d, asyncio as _a, time as _t, sqlite3 as _sq, re as _re
+
+# 1) Thread.edit をデバウンス（同一スレッド連続 rename を 1 回に集約）
+if not hasattr(_d.Thread, "_orig_edit"):
+    _d.Thread._orig_edit = _d.Thread.edit
+    _REN = {}  # tid -> {"task":Task,"name":str}
+    logger.info("[agg] patch Thread.edit")
+
+    async def _w(th:_d.Thread):
+        await _a.sleep(0.25)                 # 連続呼び出しを同時刻にまとめる
+        name = _REN[th.id].get("name")
+        try:
+            await _d.Thread._orig_edit(th, name=name)
+            logger.info(f"[agg] apply name='{name}' tid={th.id}")
+        except Exception as e:
+            logger.warning(f"[agg] apply failed: {e}")
+        finally:
+            _REN[th.id]["task"]=None
+
+    async def _edit(self:_d.Thread, *args, **kw):
+        if "name" not in kw:                # 名前以外の編集は素通し
+            return await _d.Thread._orig_edit(self, *args, **kw)
+        st=_REN.setdefault(self.id, {})
+        st["name"]=kw["name"]
+        if not st.get("task"):
+            st["task"]=_a.create_task(_w(self))
+        await st["task"]
+        return self
+
+    _d.Thread.edit = _edit
+
+# 2) “色替え系リスナー”を静かに無効化（on_interaction で rename だけをやる物を除外）
+try:
+    if hasattr(bot,"_listeners") and "on_interaction" in bot._listeners:
+        kept=[]
+        for cb in bot._listeners["on_interaction"]:
+            nm=getattr(cb,"__name__","")
+            if any(k in nm for k in ("rename","WRAP","LISTENER","STATE_COLOR","FINAL","RETRY","FIX")):
+                logger.info(f"[mute] disable listener: {nm}")
+                continue
+            kept.append(cb)
+        bot._listeners["on_interaction"]=kept
+except Exception as e:
+    logger.warning(f"[mute] skip: {e}")
+
+# 3) handle_task_action の中で確実に 1 回だけ色替え（ステータスと完全連動）
+def _em(st): return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+def _target(act): return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted","abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def _get_thread_from_db(task_id):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor(); c.execute("SELECT thread_id FROM tasks WHERE id=?", (task_id,))
+        row=c.fetchone(); c.connection.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+def _save_thread_id(task_id, thread_id):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor(); c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (thread_id, task_id))
+        c.connection.commit(); c.connection.close()
+    except Exception: pass
+
+async def _find_thread(inter, task_id, task_name):
+    # 1) DB thread_id
+    tid=_get_thread_from_db(task_id)
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,_d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,_d.Thread):
+            return th
+    # 2) 文脈（スレッド内 or 親メッセージ thread / 親chのthreads）
+    msg=inter.message
+    th = msg.channel if isinstance(msg.channel,_d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    if isinstance(th,_d.Thread):
+        _save_thread_id(task_id, th.id)
+    return th
+
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    tgt=_target(action)
+    if not tgt: return
+    # タスク名（Embed→DB の順）
+    tname=None
+    try:
+        if interaction.message.embeds:
+            title=(interaction.message.embeds[0].title or "").strip()
+            tname = title[2:].strip() if title.startswith("📋") else title
+    except Exception: pass
+    if not tname:
+        try:
+            c=_sq.connect('reminder_bot.db').cursor(); c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close(); tname=r[0] if r else None
+        except Exception: pass
+
+    th=await _find_thread(interaction, task_id, tname)
+    if not isinstance(th,_d.Thread): 
+        logger.info("[link] no thread"); return
+
+    me=interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p=th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)): 
+            logger.info("[link] no perm"); return
+
+    cur=th.name or ""; em=_em(tgt)
+    for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+        if cur.startswith(e):
+            new=em+cur[len(e):]; break
+    else:
+        new=f"{em} {cur}"
+    new=new.lstrip()
+
+    if new!=cur:
+        await th.edit(name=new)          # ← ここが集約され、最終名だけ 1 回 PATCH
+        logger.info(f"[link] '{cur}' -> '{new}' ({action})")
+    else:
+        logger.info(f"[link] no change: '{cur}' ({action})")
+# ==== /CANONICAL_RENAME ====
+
+# ==== LINK_HANDLE (single source of rename in handle_task_action) ====
+import discord as _d, sqlite3 as _sq, asyncio as _a
+
+def _emoji(st): return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+def _target(act): return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+                           "abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def _save_thread(task_id, tid):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (tid, task_id))
+        c.connection.commit(); c.connection.close()
+    except Exception: pass
+
+async def _find_thread(inter, task_id, task_name):
+    # 1) DBに保存済みの thread_id
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("SELECT thread_id FROM tasks WHERE id=?", (task_id,))
+        row=c.fetchone(); c.connection.close()
+        tid=row[0] if row else None
+    except Exception:
+        tid=None
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,_d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,_d.Thread): return th
+
+    # 2) 文脈から（スレッド内→channel、親→message.thread、親chのthreads）
+    msg=inter.message
+    th = msg.channel if isinstance(msg.channel,_d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    if isinstance(th,_d.Thread):
+        _save_thread(task_id, th.id)
+    return th
+
+# 元のハンドラを退避して上書き
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    tgt=_target(action)
+    if not tgt: return
+
+    # タスク名（Embed→DB）
+    tname=None
+    try:
+        if interaction.message.embeds:
+            title=(interaction.message.embeds[0].title or "").strip()
+            tname = title[2:].strip() if title.startswith("📋") else title
+    except Exception: pass
+    if not tname:
+        try:
+            c=_sq.connect('reminder_bot.db').cursor(); c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close()
+            tname=r[0] if r else None
+        except Exception: pass
+
+    th=await _find_thread(interaction, task_id, tname)
+    if not isinstance(th,_d.Thread):
+        await _a.sleep(0.25)            # 生成直後の競合回避
+        th=await _find_thread(interaction, task_id, tname)
+        if not isinstance(th,_d.Thread): 
+            return
+
+    me=interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p=th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+            return
+
+    cur=th.name or ""
+    em=_emoji(tgt)
+    for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+        if cur.startswith(e):
+            new=em+cur[len(e):]; break
+    else:
+        new=f"{em} {cur}"
+    new=new.lstrip()
+
+    if new!=cur:
+        await th.edit(name=new)         # ← この1回だけで色を反映
+        logger.info(f"[link] '{cur}' -> '{new}' (action={action}, id={task_id})")
+    else:
+        logger.info(f"[link] no change: '{cur}' (action={action})")
+# ==== /LINK_HANDLE ====
+
+# ==== LINK_HANDLE_FINAL (single source of truth) ====
+import discord as _d, sqlite3 as _sq, asyncio as _a
+
+def __em(st): 
+    return {"pending":"��","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+
+def __tgt(act): 
+    return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+            "abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def __save_thread_id(task_id, tid):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (tid, task_id))
+        c.connection.commit(); c.connection.close()
+    except Exception: 
+        pass
+
+def __get_thread_id(task_id):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("SELECT thread_id FROM tasks WHERE id=?", (task_id,))
+        r=c.fetchone(); c.connection.close()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+async def __find_thread(inter, task_id, task_name):
+    # 1) DBの thread_id を優先
+    tid=__get_thread_id(task_id)
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,_d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,_d.Thread): 
+            return th
+    # 2) 文脈から特定
+    msg=inter.message
+    th = msg.channel if isinstance(msg.channel,_d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: 
+            th=None
+    if isinstance(th,_d.Thread):
+        __save_thread_id(task_id, th.id)
+    return th
+
+# 直前の定義を退避し、最後にこれを使わせる
+__orig_handle = globals().get('handle_task_action')
+
+async def handle_task_action(interaction, action, task_id, assignee_id, instructor_id, current_status):
+    # 1) まず元の処理を実行（DB更新・Embed切替など）
+    if callable(__orig_handle):
+        await __orig_handle(interaction, action, task_id, assignee_id, instructor_id, current_status)
+
+    target=__tgt(action)
+    if not target: 
+        return
+
+    # 2) タスク名（Embed → DBの順）
+    task_name=None
+    try:
+        if interaction.message.embeds:
+            title=(interaction.message.embeds[0].title or "").strip()
+            task_name = title[2:].strip() if title.startswith("📋") else title
+    except Exception:
+        task_name=None
+    if not task_name:
+        try:
+            c=_sq.connect('reminder_bot.db').cursor()
+            c.execute("SELECT task_name FROM tasks WHERE id=?", (task_id,))
+            r=c.fetchone(); c.connection.close()
+            task_name=r[0] if r else None
+        except Exception:
+            task_name=None
+
+    # 3) スレッド特定（なければ少し待って再検索）
+    th=await __find_thread(interaction, task_id, task_name)
+    if not isinstance(th,_d.Thread):
+        await _a.sleep(0.25)
+        th=await __find_thread(interaction, task_id, task_name)
+        if not isinstance(th,_d.Thread):
+            return
+
+    # 4) 権限
+    me=interaction.guild.get_member(bot.user.id) if interaction.guild else None
+    if me:
+        p=th.permissions_for(me)
+        if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+            return
+
+    # 5) 先頭絵文字を 1 回だけ更新（集約パッチが入っていれば多重呼び出しでも1回にまとまる）
+    cur=th.name or ""
+    em=__em(target)
+    for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+        if cur.startswith(e):
+            new = em + cur[len(e):]; break
+    else:
+        new = f"{em} {cur}"
+    new = new.lstrip()
+
+    if new != cur:
+        await th.edit(name=new)
+        logger.info(f"[link] '{cur}' -> '{new}' (action={action}, id={task_id})")
+    else:
+        logger.info(f"[link] no change: '{cur}' (action={action})")
+# ==== /LINK_HANDLE_FINAL ====
+
+# ==== CANONICAL_EVENT (single on_interaction that updates status & renames thread) ====
+import discord as _d, sqlite3 as _sq, asyncio as _a, re as _re
+
+def _em(st): return {"pending":"🟥","accepted":"��","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+def _tgt(act): return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+                       "abandon_task":"abandoned","decline_task":"declined"}.get(act)
+
+def _save_thread_id(task_id, tid):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("UPDATE tasks SET thread_id=? WHERE id=?", (tid, task_id))
+        c.connection.commit(); c.connection.close()
+    except Exception: pass
+
+def _get_thread_id(task_id):
+    try:
+        c=_sq.connect('reminder_bot.db').cursor()
+        c.execute("SELECT thread_id FROM tasks WHERE id=?", (task_id,))
+        r=c.fetchone(); c.connection.close()
+        return r[0] if r else None
+    except Exception: return None
+
+async def _find_thread(inter, task_id, task_name):
+    tid=_get_thread_id(task_id)
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,_d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,_d.Thread): return th
+    msg=inter.message
+    th=msg.channel if isinstance(msg.channel,_d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    if isinstance(th,_d.Thread): _save_thread_id(task_id, th.id)
+    return th
+
+# 既存 on_ready をラップして、余分な on_interaction リスナーを無効化→正規リスナーを登録
+__orig_ready = getattr(bot, "on_ready", None)
+
+@bot.event
+async def on_ready():
+    if callable(__orig_ready):
+        await __orig_ready()
+
+    try:
+        # 既存の on_interaction リスナーを全削除（このあと正規リスナーを 1 個だけ追加）
+        if hasattr(bot, "_listeners") and "on_interaction" in bot._listeners:
+            bot._listeners["on_interaction"] = []
+            logger.info("[canon] cleared existing on_interaction listeners")
+    except Exception as e:
+        logger.warning(f"[canon] clear failed: {e}")
+
+    # 正規 on_interaction を登録
+    @bot.listen('on_interaction')
+    async def __canon_interaction(inter: _d.Interaction):
+        try:
+            if inter.type != _d.InteractionType.component:
+                return
+            data=inter.data or {}
+            cid = data.get('custom_id') or ''
+            m=_re.match(r'^(accept_task|decline_task|complete_task|abandon_task|undo_completion)_(\d+)$', cid)
+            if not m: 
+                return
+            action, task_id = m.group(1), int(m.group(2))
+
+            # DBから担当/指示/ステータス/タスク名を取得
+            try:
+                c=_sq.connect('reminder_bot.db').cursor()
+                c.execute("SELECT assignee_id,instructor_id,status,task_name FROM tasks WHERE id=?", (task_id,))
+                row=c.fetchone(); c.connection.close()
+            except Exception as e:
+                logger.error(f"[canon] DB fetch failed: {e}", exc_info=True); return
+            if not row: 
+                logger.info("[canon] task not found"); return
+            assignee_id, instructor_id, current_status, task_name = row
+
+            # まず元の handle_task_action（直前に定義された最新版）を呼ぶ → DB/Embed/ボタン更新
+            if "handle_task_action" in globals() and callable(globals()["handle_task_action"]):
+                await globals()["handle_task_action"](inter, action, task_id, assignee_id, instructor_id, current_status)
+
+            # 望ましい状態をアクションから直接決定（DB伝播待ちレースを回避）
+            target = _tgt(action)
+            if not target: return
+
+            # 対象スレッドを特定（thread_idなければ補完）
+            th = await _find_thread(inter, task_id, task_name)
+            if not isinstance(th,_d.Thread):
+                # 作成直後の競合回避
+                await _a.sleep(0.25)
+                th = await _find_thread(inter, task_id, task_name)
+                if not isinstance(th,_d.Thread): 
+                    logger.info("[canon] no thread"); return
+
+            # 権限
+            me = inter.guild.get_member(bot.user.id) if inter.guild else None
+            if me:
+                p=th.permissions_for(me)
+                if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+                    logger.info("[canon] no perm"); return
+
+            # 先頭絵文字を 1 回だけ更新（集約パッチが入っていれば自然と 1 回に統合）
+            cur = th.name or ""
+            em  = _em(target)
+            for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+                if cur.startswith(e):
+                    new = em + cur[len(e):]; break
+            else:
+                new = f"{em} {cur}"
+            new = new.lstrip()
+
+            if new != cur:
+                await th.edit(name=new)
+                logger.info(f"[canon] '{cur}' -> '{new}' (action={action}, id={task_id})")
+            else:
+                logger.info(f"[canon] no change: '{cur}' (action={action})")
+
+        except Exception as e:
+            logger.error(f"[canon] failed: {e}", exc_info=True)
+
+    logger.info("[canon] canonical on_interaction installed")
+# ==== /CANONICAL_EVENT ====
+
+# ==== CANONICAL_NO_RECURSION (single on_interaction; no call to handle_task_action) ====
+import discord as _d, sqlite3 as _sq, asyncio as _a, re as _re, datetime as _dt
+
+def _map_status(action):
+    return {
+        "accept_task": "accepted",
+        "decline_task": "declined",
+        "complete_task": "completed",
+        "abandon_task": "abandoned",
+        "undo_completion": "accepted",
+    }.get(action)
+
+def _emoji(st): 
+    return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+
+def _db_exec(sql, params=(), fetch=False):
+    conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params)
+    rows=cur.fetchall() if fetch else None
+    conn.commit(); conn.close()
+    return rows
+
+def _get_task(task_id):
+    rows=_db_exec("SELECT assignee_id,instructor_id,task_name,due_date,thread_id FROM tasks WHERE id=?", (task_id,), fetch=True)
+    return rows[0] if rows else None
+
+async def _find_thread(inter, task_id, task_name):
+    # 1) DBのthread_id 優先
+    rid=_db_exec("SELECT thread_id FROM tasks WHERE id=?", (task_id,), fetch=True)
+    tid=rid[0][0] if rid and rid[0] and rid[0][0] else None
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,_d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,_d.Thread): 
+            return th
+    # 2) 文脈から
+    msg=inter.message
+    th=msg.channel if isinstance(msg.channel,_d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,_d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    # 3) 見つかったら保存
+    if isinstance(th,_d.Thread):
+        try: _db_exec("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+        except Exception: pass
+    return th
+
+def _build_view(task_id, assignee_id, instructor_id, status):
+    try:
+        return TaskView(task_id, assignee_id, instructor_id, status)
+    except Exception:
+        return None
+
+def _build_embed(title, due_dt, status):
+    color = _d.Color.blue()
+    if status=="pending": color=_d.Color.red()
+    elif status=="accepted": color=_d.Color.gold()
+    elif status=="completed": color=_d.Color.green()
+    elif status=="abandoned": color=_d.Color.orange()
+    elif status=="declined": color=_d.Color.dark_gray()
+
+    due_str = due_dt if isinstance(due_dt,str) else (due_dt.strftime("%Y/%m/%d %H:%M") if isinstance(due_dt,_dt.datetime) else str(due_dt))
+    e=_d.Embed(title=title or "📋 タスク", description=f"**期日: {due_str}**", color=color)
+    # Status表示（必要ならフィールドを足す）
+    e.add_field(name="Status", value=status, inline=True)
+    return e
+
+__installed=False
+__orig_ready=getattr(bot,"on_ready",None)
+
+@bot.event
+async def on_ready():
+    global __installed
+    if callable(__orig_ready):
+        await __orig_ready()
+    if __installed:
+        return
+    __installed=True
+    logger.info("[canon2] installed (no recursion)")
+
+    @bot.listen('on_interaction')
+    async def __canon2(inter:_d.Interaction):
+        try:
+            if inter.type != _d.InteractionType.component:
+                return
+            cid=(inter.data or {}).get('custom_id') or ''
+            m=_re.match(r'^(accept_task|decline_task|complete_task|abandon_task|undo_completion)_(\d+)$', cid)
+            if not m:
+                return
+            action, task_id = m.group(1), int(m.group(2))
+            new_status = _map_status(action)
+            if not new_status:
+                return
+
+            # 1) 直近のタスク情報
+            row = _get_task(task_id)
+            if not row:
+                logger.info("[canon2] task missing"); return
+            assignee_id, instructor_id, task_name, due, _ = row
+
+            # 2) DBのステータスを更新（このハンドラが単独で完結）
+            _db_exec("UPDATE tasks SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status, task_id))
+
+            # 3) Embed/ボタンを更新
+            title = (inter.message.embeds[0].title if inter.message.embeds else f"📋 {task_name}") or f"📋 {task_name}"
+            emb = _build_embed(title, due, new_status)
+            view = _build_view(task_id, assignee_id, instructor_id, new_status)
+
+            try:
+                if not inter.response.is_done():
+                    await inter.response.edit_message(embed=emb, view=view)
+                else:
+                    await inter.message.edit(embed=emb, view=view)
+            except Exception:
+                # 応答がすでに終わっている場合は無視
+                pass
+
+            # 4) スレッド名の絵文字を変更（1回だけ）
+            th = await _find_thread(inter, task_id, task_name)
+            if isinstance(th,_d.Thread):
+                me = inter.guild.get_member(bot.user.id) if inter.guild else None
+                if (not me) or getattr(th.permissions_for(me),"manage_threads",False) or getattr(th.permissions_for(me),"manage_channels",False):
+                    cur = th.name or ""
+                    em  = _emoji(new_status)
+                    for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+                        if cur.startswith(e):
+                            new = em + cur[len(e):]; break
+                    else:
+                        new = f"{em} {cur}"
+                    new = new.lstrip()
+                    if new != cur:
+                        await th.edit(name=new)
+                        logger.info(f"[canon2] '{cur}' -> '{new}' ({action}, id={task_id})")
+                    else:
+                        logger.info(f"[canon2] no change: '{cur}' ({action})")
+                else:
+                    logger.info("[canon2] no permission to rename")
+            else:
+                logger.info("[canon2] thread not found")
+        except Exception as e:
+            logger.error(f"[canon2] failed: {e}", exc_info=True)
+# ==== /CANONICAL_NO_RECURSION ====
+
+# ==== CANONICAL2_INSTALLER (wait_until_ready; force add_listener) ====
+import discord as __d, sqlite3 as __sq, asyncio as __a, re as __r, datetime as __dt
+
+def __c2_status(action):
+    return {
+        "accept_task": "accepted",
+        "decline_task": "declined",
+        "complete_task": "completed",
+        "abandon_task": "abandoned",
+        "undo_completion": "accepted",
+    }.get(action)
+
+def __c2_emoji(st): 
+    return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(st,"⚪")
+
+def __c2_exec(sql, params=(), fetch=False):
+    conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params)
+    rows=cur.fetchall() if fetch else None
+    conn.commit(); conn.close(); return rows
+
+async def __c2_find_thread(inter, task_id, task_name):
+    # DB優先
+    rid=__c2_exec("SELECT thread_id FROM tasks WHERE id=?", (task_id,), fetch=True)
+    tid=rid[0][0] if rid and rid[0] and rid[0][0] else None
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,__d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,__d.Thread): return th
+    # 文脈
+    msg=inter.message
+    th=msg.channel if isinstance(msg.channel,__d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,__d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    if isinstance(th,__d.Thread):
+        try: __c2_exec("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+        except Exception: pass
+    return th
+
+def __c2_build_embed(title, due_dt, status):
+    color = __d.Color.blurple()
+    if status=="pending": color=__d.Color.red()
+    elif status=="accepted": color=__d.Color.gold()
+    elif status=="completed": color=__d.Color.green()
+    elif status=="abandoned": color=__d.Color.orange()
+    elif status=="declined": color=__d.Color.dark_gray()
+    due_str = due_dt if isinstance(due_dt,str) else (due_dt.strftime("%Y/%m/%d %H:%M") if isinstance(due_dt,__dt.datetime) else str(due_dt))
+    e=__d.Embed(title=title, description=f"**期日: {due_str}**", color=color)
+    e.add_field(name="Status", value=status, inline=True)
+    return e
+
+async def __canon2_handler(inter: __d.Interaction):
+    try:
+        if inter.type != __d.InteractionType.component:
+            return
+        cid=(inter.data or {}).get('custom_id') or ''
+        m=__r.match(r'^(accept_task|decline_task|complete_task|abandon_task|undo_completion)_(\d+)$', cid)
+        if not m: return
+        action, task_id = m.group(1), int(m.group(2))
+        new_status = __c2_status(action)
+        if not new_status: return
+
+        # 直近タスク情報
+        row=__c2_exec("SELECT assignee_id,instructor_id,task_name,due_date FROM tasks WHERE id=?", (task_id,), fetch=True)
+        if not row: 
+            logger.info("[canon2] task missing"); return
+        assignee_id, instructor_id, task_name, due = row[0]
+
+        # DBのステータスを当ハンドラで更新（再帰させない）
+        __c2_exec("UPDATE tasks SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status, task_id))
+
+        # 表示更新（Embed/ボタン）
+        title=(inter.message.embeds[0].title if inter.message.embeds else f"📋 {task_name}") or f"📋 {task_name}"
+        emb=__c2_build_embed(title, due, new_status)
+        try:
+            view=TaskView(task_id, assignee_id, instructor_id, new_status)
+        except Exception:
+            view=None
+
+        try:
+            if not inter.response.is_done():
+                await inter.response.edit_message(embed=emb, view=view)
+            else:
+                await inter.message.edit(embed=emb, view=view)
+        except Exception:
+            pass
+
+        # スレッド名の絵文字を 1 回だけ変更
+        th=await __c2_find_thread(inter, task_id, task_name)
+        if isinstance(th,__d.Thread):
+            me=inter.guild.get_member(bot.user.id) if inter.guild else None
+            if (not me) or getattr(th.permissions_for(me),"manage_threads",False) or getattr(th.permissions_for(me),"manage_channels",False):
+                cur=th.name or ""; em=__c2_emoji(new_status)
+                for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+                    if cur.startswith(e): new=em+cur[len(e):]; break
+                else: new=f"{em} {cur}"
+                new=new.lstrip()
+                if new!=cur:
+                    await th.edit(name=new)
+                    logger.info(f"[canon2] '{cur}' -> '{new}' (action={action}, id={task_id})")
+                else:
+                    logger.info(f"[canon2] no change: '{cur}' (action={action})")
+            else:
+                logger.info("[canon2] no permission to rename")
+        else:
+            logger.info("[canon2] thread not found")
+    except Exception as e:
+        logger.error(f"[canon2] failed: {e}", exc_info=True)
+
+async def __canon2_install():
+    await bot.wait_until_ready()
+    try:
+        # 既存の on_interaction を全て消して、1 本だけ登録
+        if hasattr(bot,"_listeners"):
+            bot._listeners["on_interaction"]= []
+    except Exception:
+        pass
+    bot.add_listener(__canon2_handler, "on_interaction")
+    logger.info("[canon2] installed via wait_until_ready")
+
+try:
+    bot.loop.create_task(__canon2_install())
+except Exception as e:
+    logger.error(f"[canon2] schedule failed: {e}", exc_info=True)
+# ==== /CANONICAL2_INSTALLER ====
+
+# ==== C2_FORCE (pre-run, rename-only listener) ====
+import discord as __d, sqlite3 as __sq, re as __re, asyncio as __a
+
+def __c2_emoji(status): 
+    return {"pending":"🟥","accepted":"🟨","completed":"🟩","abandoned":"⚠️","declined":"❌"}.get(status,"⚪")
+
+def __c2_target(action):
+    return {"accept_task":"accepted","complete_task":"completed","undo_completion":"accepted",
+            "abandon_task":"abandoned","decline_task":"declined"}.get(action)
+
+def __c2_exec(sql, params=(), fetch=False):
+    conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params)
+    rows=cur.fetchall() if fetch else None
+    conn.commit(); conn.close()
+    return rows
+
+async def __c2_find_thread(inter, task_id, task_name):
+    # DBの thread_id 優先
+    rid=__c2_exec("SELECT thread_id FROM tasks WHERE id=?", (task_id,), fetch=True)
+    tid=rid[0][0] if rid and rid[0] and rid[0][0] else None
+    th=None
+    if tid:
+        th=inter.client.get_channel(tid)
+        if not isinstance(th,__d.Thread):
+            try: th=await inter.client.fetch_channel(tid)
+            except Exception: th=None
+        if isinstance(th,__d.Thread): 
+            return th
+    # 文脈から
+    msg=inter.message
+    th=msg.channel if isinstance(msg.channel,__d.Thread) else getattr(msg,"thread",None)
+    if not isinstance(th,__d.Thread):
+        try:
+            for t in getattr(msg.channel,"threads",[]):
+                if task_name and task_name in (t.name or ""):
+                    th=t; break
+        except Exception: th=None
+    # 見つかったら保存
+    if isinstance(th,__d.Thread):
+        try: __c2_exec("UPDATE tasks SET thread_id=? WHERE id=?", (th.id, task_id))
+        except Exception: pass
+    return th
+
+async def __c2_handler(inter: __d.Interaction):
+    try:
+        if inter.type != __d.InteractionType.component:
+            return
+        cid=(inter.data or {}).get('custom_id') or ''
+        m=__re.match(r'^(accept_task|decline_task|complete_task|abandon_task|undo_completion)_(\d+)$', cid)
+        if not m: return
+        action, task_id = m.group(1), int(m.group(2))
+        target = __c2_target(action)
+        if not target: return
+
+        # タスク名（Embedから取得、なければDB）
+        name=None
+        try:
+            if inter.message.embeds:
+                title=(inter.message.embeds[0].title or "").strip()
+                name = title[2:].strip() if title.startswith("📋") else title
+        except Exception: pass
+        if not name:
+            rows=__c2_exec("SELECT task_name FROM tasks WHERE id=?", (task_id,), fetch=True)
+            name = rows[0][0] if rows else None
+
+        # 元処理がEmbed更新等を終えるまで軽く待つ
+        await __a.sleep(0.25)
+
+        th=await __c2_find_thread(inter, task_id, name)
+        if not isinstance(th,__d.Thread):
+            return
+
+        me = inter.guild.get_member(bot.user.id) if inter.guild else None
+        if me:
+            p=th.permissions_for(me)
+            if not (getattr(p,"manage_threads",False) or getattr(p,"manage_channels",False)):
+                return
+
+        cur=th.name or ""; em=__c2_emoji(target)
+        # 先頭の絵文字を置換／付与
+        for e in ("🟥","🟨","🟩","⚠️","❌","⚪"):
+            if cur.startswith(e):
+                new=em+cur[len(e):]; break
+        else:
+            new=f"{em} {cur}"
+        new=new.lstrip()
+
+        if new!=cur:
+            await th.edit(name=new)    # Thread.edit は集約パッチで1回に統合される
+            logger.info(f"[c2] '{cur}' -> '{new}' (action={action}, id={task_id})")
+        else:
+            logger.info(f"[c2] no change: '{cur}' (action={action})")
+    except Exception as e:
+        logger.error(f"[c2] failed: {e}", exc_info=True)
+
+# 既存リスナーは触らず、rename専用のハンドラを“前もって”登録
+bot.add_listener(__c2_handler, "on_interaction")
+logger.info("[c2] rename-only handler added pre-run")
+# ==== /C2_FORCE ====
+
+# ==== RENAME_AGG_COOLDOWN (debounce + cooldown for Thread.edit) ====
+import discord as __d, asyncio as __aio, time as __time, logging as __logging
+__log = __logging.getLogger(__name__)
+
+# すでに _orig_edit が無ければ退避
+if not hasattr(__d.Thread, "_orig_edit"):
+    __d.Thread._orig_edit = __d.Thread.edit
+
+# 状態: tid -> {desired:str, task:Task|None, last:float}
+__REN_STATE = {}
+__COOLDOWN_SEC = 2.5  # この秒数以内の連続 rename は捨てる
+
+async def __ren_worker(th: __d.Thread):
+    st = __REN_STATE.setdefault(th.id, {})
+    # 連続呼び出しを同時刻にまとめる
+    await __aio.sleep(0.20)
+    name = st.get("desired")
+    # クールダウン: 直近の適用から一定時間未満なら捨てる
+    last = st.get("last", 0.0)
+    if __time.monotonic() - last < __COOLDOWN_SEC:
+        st["task"] = None
+        return
+    try:
+        await __d.Thread._orig_edit(th, name=name)
+        st["last"] = __time.monotonic()
+        __log.info(f"[agg] apply name='{name}' tid={th.id}")
+    except Exception as e:
+        __log.warning(f"[agg] apply failed: {e}")
+    finally:
+        st["task"] = None
+
+async def __patched_edit(self: __d.Thread, *args, **kw):
+    # 名前以外の編集は素通し
+    if "name" not in kw:
+        return await __d.Thread._orig_edit(self, *args, **kw)
+
+    st = __REN_STATE.setdefault(self.id, {})
+    st["desired"] = kw["name"]
+
+    # クールダウン中なら即スキップ（desired は最新に残す）
+    last = st.get("last", 0.0)
+    if __time.monotonic() - last < __COOLDOWN_SEC:
+        return self
+
+    # 実行中タスクが無ければ起動、あれば合流
+    if not st.get("task"):
+        st["task"] = __aio.create_task(__ren_worker(self))
+    await st["task"]
+    return self
+
+__d.Thread.edit = __patched_edit
+# ==== /RENAME_AGG_COOLDOWN ====
+
+# ==== RENAME_AGG_COOLDOWN_V2 (debounce + cooldown + applied-name dedupe) ====
+import discord as _d, asyncio as _a, time as _t, logging as _lg
+_log=_lg.getLogger(__name__)
+
+# 既に退避していなければ保存
+if not hasattr(_d.Thread,'_orig_edit'):
+    _d.Thread._orig_edit = _d.Thread.edit
+
+_STATE = {}           # tid -> {"desired":str, "applied":str, "last":float, "task":Task|None}
+_COOLDOWN = 4.0       # 同一スレッドの連続 rename はこの秒数以内なら捨てる
+_DEBOUNCE  = 0.20     # 呼び出しをまとめるための待ち
+
+async def _worker(th:_d.Thread):
+    st=_STATE.setdefault(th.id,{})
+    await _a.sleep(_DEBOUNCE)
+    desired = st.get("desired")
+    last    = st.get("last", 0.0)
+    applied = st.get("applied")
+
+    # 直前と同じ希望名なら捨てる
+    if desired and applied and desired == applied:
+        st["task"]=None; return
+    # クールダウン中なら捨てる
+    if _t.monotonic() - last < _COOLDOWN:
+        st["task"]=None; return
+
+    try:
+        await _d.Thread._orig_edit(th, name=desired)
+        st["last"]    = _t.monotonic()
+        st["applied"] = desired
+        _log.info(f"[agg] apply name='{desired}' tid={th.id}")
+    except Exception as e:
+        _log.warning(f"[agg] apply failed: {e}")
+    finally:
+        st["task"]=None
+
+async def _patched_edit(self:_d.Thread,*args,**kw):
+    # 名前以外の編集は素通し
+    if "name" not in kw:
+        return await _d.Thread._orig_edit(self,*args,**kw)
+
+    st=_STATE.setdefault(self.id,{})
+    st["desired"] = kw["name"]
+
+    # 直前に適用済みの名前と同じ＆クールダウン中なら即スキップ
+    last    = st.get("last",0.0)
+    applied = st.get("applied")
+    if applied and kw["name"] == applied and _t.monotonic() - last < _COOLDOWN:
+        return self
+
+    # ワーカーが無ければ起動、あれば合流（1回に集約）
+    if not st.get("task"):
+        st["task"]=_a.create_task(_worker(self))
+    await st["task"]
+    return self
+
+_d.Thread.edit = _patched_edit
+# ==== /RENAME_AGG_COOLDOWN_V2 ====
+
+# ==== RENAME_AGG_COOLDOWN_V2 (debounce + cooldown + applied-name dedupe) ====
+import discord as _d, asyncio as _a, time as _t, logging as _lg
+_log=_lg.getLogger(__name__)
+
+# 既に退避していなければ保存
+if not hasattr(_d.Thread,'_orig_edit'):
+    _d.Thread._orig_edit = _d.Thread.edit
+
+_STATE = {}           # tid -> {"desired":str, "applied":str, "last":float, "task":Task|None}
+_COOLDOWN = 4.0       # 同一スレッドの連続 rename はこの秒数以内なら捨てる
+_DEBOUNCE  = 0.20     # 呼び出しをまとめるための待ち
+
+async def _worker(th:_d.Thread):
+    st=_STATE.setdefault(th.id,{})
+    await _a.sleep(_DEBOUNCE)
+    desired = st.get("desired")
+    last    = st.get("last", 0.0)
+    applied = st.get("applied")
+
+    # 直前と同じ希望名なら捨てる
+    if desired and applied and desired == applied:
+        st["task"]=None; return
+    # クールダウン中なら捨てる
+    if _t.monotonic() - last < _COOLDOWN:
+        st["task"]=None; return
+
+    try:
+        await _d.Thread._orig_edit(th, name=desired)
+        st["last"]    = _t.monotonic()
+        st["applied"] = desired
+        _log.info(f"[agg] apply name='{desired}' tid={th.id}")
+    except Exception as e:
+        _log.warning(f"[agg] apply failed: {e}")
+    finally:
+        st["task"]=None
+
+async def _patched_edit(self:_d.Thread,*args,**kw):
+    # 名前以外の編集は素通し
+    if "name" not in kw:
+        return await _d.Thread._orig_edit(self,*args,**kw)
+
+    st=_STATE.setdefault(self.id,{})
+    st["desired"] = kw["name"]
+
+    # 直前に適用済みの名前と同じ＆クールダウン中なら即スキップ
+    last    = st.get("last",0.0)
+    applied = st.get("applied")
+    if applied and kw["name"] == applied and _t.monotonic() - last < _COOLDOWN:
+        return self
+
+    # ワーカーが無ければ起動、あれば合流（1回に集約）
+    if not st.get("task"):
+        st["task"]=_a.create_task(_worker(self))
+    await st["task"]
+    return self
+
+_d.Thread.edit = _patched_edit
+# ==== /RENAME_AGG_COOLDOWN_V2 ====
+
+
+if __name__ == "__main__":
+    token=os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        raise SystemExit("DISCORD_BOT_TOKEN が未設定です。export DISCORD_BOT_TOKEN=... で設定してください。")
+    bot.run(token)
+# ==== HOTFIX: verbose on_command_error ====
+@bot.event
+async def on_command_error(ctx, error):
+    try:
+        logger.error(f"[CMD:{getattr(ctx.command,'name',None)}] Uncaught command error", exc_info=True)
+    finally:
+        try:
+            await ctx.send("❌ コマンド実行中にエラーが発生しました。（詳細はログ）")
+        except Exception:
+            pass
+# ==== /HOTFIX ====
+@bot.event
+async def on_command_error(ctx, error):
+    try:
+        logger.error(f"[CMD:{getattr(ctx.command,'name',None)}] Uncaught command error", exc_info=True)
+    finally:
+        try:
+            await ctx.send("❌ コマンド実行中にエラーが発生しました。（詳細はログ）")
+        except Exception:
+            pass
+# ==== HOTFIX (safe overrides) ====
+import sqlite3 as _sqlite3
+import datetime as _dt
+import discord as _discord
+
+# 1) DatabaseManager.add_task を必ず ID を返す実装に差し替え
+def __fixed_add_task(guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id):
+    conn = _sqlite3.connect('reminder_bot.db')
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id)
+    )
+    tid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return tid
+
+try:
+    DatabaseManager.add_task = staticmethod(__fixed_add_task)
+except NameError:
+    pass
+
+# 2) send_task_notification を 7引数・task_id 省略可の安全版に差し替え
+async def __fixed_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id: int=None):
+    try:
+        if task_id is None:
+            row = DatabaseManager.execute_query(
+                "SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (guild.id, assignee.id, task_name)
+            )
+            if not row:
+                logger.error("Task not found just after insert (fallback search failed).")
+                return
+            task_id = row[0][0]
+
+        ch_name = f"to-{assignee.display_name}"
+        ch = _discord.utils.get(guild.channels, name=ch_name)
+        if not ch:
+            try:
+                ow = {
+                    guild.default_role: _discord.PermissionOverwrite(read_messages=False),
+                    assignee: _discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                }
+                ch = await guild.create_text_channel(ch_name, overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro = _discord.Embed(title="📋 個人タスクチャンネル",
+                                       description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                       color=_discord.Color.blue())
+                intro.add_field(name="機能", value="• タスク通知の受信\n• タスクの受託・完了報告\n• 進捗状況の確認", inline=False)
+                await ch.send(embed=intro)
+            except Exception as e:
+                try:
+                    ch = await assignee.create_dm()
+                except:
+                    logger.error(f"Failed to create personal channel/DM: {e}")
+                    return
+
+        embed = _discord.Embed(
+            title=f"📋 {task_name}",
+            description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
+            color=_discord.Color.gold()
+        )
+        view = TaskView(task_id, assignee.id, instructor.id, "pending")
+        msg = await ch.send(assignee.mention, embed=embed, view=view)
+
+        try:
+            thread = await msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+            detail = _discord.Embed(title="📋 タスク詳細", color=_discord.Color.blue())
+            detail.add_field(name="指示者", value=instructor.mention, inline=True)
+            detail.add_field(name="状態", value="🟥 未受託", inline=True)
+            detail.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+            await thread.send(embed=detail, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"__fixed_send_task_notification error: {e}", exc_info=True)
+
+try:
+    send_task_notification = __fixed_send_task_notification
+except NameError:
+    pass
+
+# 3) !test を未定義変数なしの完成版で再登録
+try:
+    bot.remove_command('test')
+    bot.remove_command('テスト')
+except Exception:
+    pass
+
+@bot.command(name='テスト', aliases=['test'])
+async def __fixed_test(ctx):
+    try:
+        due = _dt.datetime.now() + _dt.timedelta(days=1)
+        due = due.replace(hour=23, minute=59, second=0, microsecond=0)
+        task_id = DatabaseManager.add_task(
+            guild_id=ctx.guild.id,
+            instructor_id=ctx.author.id,
+            assignee_id=ctx.author.id,
+            task_name="テストタスク",
+            due_date=due,
+            message_id=ctx.message.id,
+            channel_id=ctx.channel.id
+        )
+        if not DatabaseManager.execute_query("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
+            await ctx.send("❌ タスク作成に失敗しました。（直後確認NG）")
+            return
+        await send_task_notification(ctx.guild, ctx.author, ctx.author, "テストタスク", due, ctx.message.id, task_id=task_id)
+        ok = _discord.Embed(title="🧪 テストタスク作成", description="タスク作成機能のテストが成功しました！", color=_discord.Color.green())
+        ok.add_field(name="タスクID", value=str(task_id), inline=True)
+        ok.add_field(name="期日", value=due.strftime("%Y/%m/%d %H:%M"), inline=True)
+        await ctx.send(embed=ok)
+    except Exception as e:
+        logger.error(f"fixed test error: {e}", exc_info=True)
+        await ctx.send("❌ テスト中にエラーが発生しました。")
+# ==== /HOTFIX ====
+# ==== HOTFIX (safe overrides) ====
+import sqlite3 as _sqlite3
+import datetime as _dt
+import discord as _discord
+
+# 1) DatabaseManager.add_task を必ず ID を返す実装に差し替え
+def __fixed_add_task(guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id):
+    conn = _sqlite3.connect('reminder_bot.db')
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id)
+    )
+    tid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return tid
+
+try:
+    DatabaseManager.add_task = staticmethod(__fixed_add_task)
+except NameError:
+    pass
+
+# 2) send_task_notification を 7引数・task_id 省略可の安全版に差し替え
+async def __fixed_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id: int=None):
+    try:
+        if task_id is None:
+            row = DatabaseManager.execute_query(
+                "SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (guild.id, assignee.id, task_name)
+            )
+            if not row:
+                logger.error("Task not found just after insert (fallback search failed).")
+                return
+            task_id = row[0][0]
+
+        ch_name = f"to-{assignee.display_name}"
+        ch = _discord.utils.get(guild.channels, name=ch_name)
+        if not ch:
+            try:
+                ow = {
+                    guild.default_role: _discord.PermissionOverwrite(read_messages=False),
+                    assignee: _discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                }
+                ch = await guild.create_text_channel(ch_name, overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro = _discord.Embed(title="📋 個人タスクチャンネル",
+                                       description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                       color=_discord.Color.blue())
+                intro.add_field(name="機能", value="• タスク通知の受信\n• タスクの受託・完了報告\n• 進捗状況の確認", inline=False)
+                await ch.send(embed=intro)
+            except Exception as e:
+                try:
+                    ch = await assignee.create_dm()
+                except:
+                    logger.error(f"Failed to create personal channel/DM: {e}")
+                    return
+
+        embed = _discord.Embed(
+            title=f"📋 {task_name}",
+            description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
+            color=_discord.Color.gold()
+        )
+        view = TaskView(task_id, assignee.id, instructor.id, "pending")
+        msg = await ch.send(assignee.mention, embed=embed, view=view)
+
+        try:
+            thread = await msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+            detail = _discord.Embed(title="📋 タスク詳細", color=_discord.Color.blue())
+            detail.add_field(name="指示者", value=instructor.mention, inline=True)
+            detail.add_field(name="状態", value="🟥 未受託", inline=True)
+            detail.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+            await thread.send(embed=detail, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"__fixed_send_task_notification error: {e}", exc_info=True)
+
+try:
+    send_task_notification = __fixed_send_task_notification
+except NameError:
+    pass
+
+# 3) !test を未定義変数なしの完成版で再登録
+try:
+    bot.remove_command('test')
+    bot.remove_command('テスト')
+except Exception:
+    pass
+
+@bot.command(name='テスト', aliases=['test'])
+async def __fixed_test(ctx):
+    try:
+        due = _dt.datetime.now() + _dt.timedelta(days=1)
+        due = due.replace(hour=23, minute=59, second=0, microsecond=0)
+        task_id = DatabaseManager.add_task(
+            guild_id=ctx.guild.id,
+            instructor_id=ctx.author.id,
+            assignee_id=ctx.author.id,
+            task_name="テストタスク",
+            due_date=due,
+            message_id=ctx.message.id,
+            channel_id=ctx.channel.id
+        )
+        if not DatabaseManager.execute_query("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
+            await ctx.send("❌ タスク作成に失敗しました。（直後確認NG）")
+            return
+        await send_task_notification(ctx.guild, ctx.author, ctx.author, "テストタスク", due, ctx.message.id, task_id=task_id)
+        ok = _discord.Embed(title="🧪 テストタスク作成", description="タスク作成機能のテストが成功しました！", color=_discord.Color.green())
+        ok.add_field(name="タスクID", value=str(task_id), inline=True)
+        ok.add_field(name="期日", value=due.strftime("%Y/%m/%d %H:%M"), inline=True)
+        await ctx.send(embed=ok)
+    except Exception as e:
+        logger.error(f"fixed test error: {e}", exc_info=True)
+        await ctx.send("❌ テスト中にエラーが発生しました。")
+# ==== /HOTFIX ====
+# ==== HOTFIX2 (DB直叩き・安全上書き) ====
+import sqlite3 as _sqlite3, datetime as _dt, discord as _discord
+
+def __q(sql, params=()):
+    conn=_sqlite3.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute(sql, params); rows=cur.fetchall()
+    conn.commit(); conn.close(); return rows
+
+# add_task と send_task_notification を DB直叩きで動く形に（既存があっても下で再バインド）
+def __fx2_add_task(guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id):
+    conn=_sqlite3.connect('reminder_bot.db'); cur=conn.cursor()
+    cur.execute("INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) VALUES (?,?,?,?,?,?,?)",
+                (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id))
+    tid=cur.lastrowid; conn.commit(); conn.close()
+    return tid
+
+async def __fx2_send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id, task_id=None):
+    try:
+        if task_id is None:
+            row=__q("SELECT id FROM tasks WHERE guild_id=? AND assignee_id=? AND task_name=? ORDER BY created_at DESC LIMIT 1",
+                    (guild.id, assignee.id, task_name))
+            if not row: 
+                logger.error("[HOTFIX2] task lookup failed"); return
+            task_id=row[0][0]
+
+        ch=_discord.utils.get(guild.channels, name=f"to-{assignee.display_name}")
+        if not ch:
+            try:
+                ow={guild.default_role:_discord.PermissionOverwrite(read_messages=False),
+                    assignee:_discord.PermissionOverwrite(read_messages=True, send_messages=True)}
+                ch=await guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow, topic=f"{assignee.display_name}の個人タスク管理チャンネル")
+                intro=_discord.Embed(title="📋 個人タスクチャンネル",
+                                     description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
+                                     color=_discord.Color.blue())
+                await ch.send(embed=intro)
+            except Exception:
+                try: ch=await assignee.create_dm()
+                except: return
+
+        embed=_discord.Embed(title=f"📋 {task_name}", description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**", color=_discord.Color.gold())
+        view=TaskView(task_id, assignee.id, instructor.id, "pending")
+        msg=await ch.send(assignee.mention, embed=embed, view=view)
+
+        try:
+            th=await msg.create_thread(name=f"🟥 {task_name} - 詳細", auto_archive_duration=60, reason="タスク詳細情報")
+            detail=_discord.Embed(title="📋 タスク詳細", color=_discord.Color.blue())
+            detail.add_field(name="指示者", value=instructor.mention, inline=True)
+            detail.add_field(name="状態", value="🟥 未受託", inline=True)
+            detail.add_field(name="作成日時", value=_dt.datetime.now().strftime("%Y/%m/%d %H:%M"), inline=True)
+            await th.send(embed=detail, view=TaskView(task_id, assignee.id, instructor.id, "pending"))
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[HOTFIX2] send_task_notification error: {e}", exc_info=True)
+
+# 既存実装を上書き
+try:
+    DatabaseManager.add_task = staticmethod(__fx2_add_task)
+except Exception:
+    pass
+send_task_notification = __fx2_send_task_notification
+
+# !test を DB直叩きで再登録
+try:
+    bot.remove_command('test'); bot.remove_command('テスト')
+except Exception:
+    pass
+
+@bot.command(name='テスト', aliases=['test'])
+async def __fx2_test(ctx):
+    try:
+        due=_dt.datetime.now()+_dt.timedelta(days=1)
+        due=due.replace(hour=23,minute=59,second=0,microsecond=0)
+        task_id=__fx2_add_task(ctx.guild.id, ctx.author.id, ctx.author.id, "テストタスク", due, ctx.message.id, ctx.channel.id)
+        if not __q("SELECT 1 FROM tasks WHERE id=?", (task_id,)):
+            await ctx.send("❌ タスク作成に失敗しました。（直後確認NG）"); return
+        await __fx2_send_task_notification(ctx.guild, ctx.author, ctx.author, "テストタスク", due, ctx.message.id, task_id=task_id)
+        ok=_discord.Embed(title="🧪 テストタスク作成", description="タスク作成機能のテストが成功しました！", color=_discord.Color.green())
+        ok.add_field(name="タスクID", value=str(task_id), inline=True)
+        ok.add_field(name="期日", value=due.strftime('%Y/%m/%d %H:%M'), inline=True)
+        await ctx.send(embed=ok)
+    except Exception as e:
+        logger.error(f"[HOTFIX2] test error: {e}", exc_info=True)
+        await ctx.send("❌ テスト中にエラーが発生しました。")
+# ==== /HOTFIX2 ====
+
+@bot.command(name='perms_threads')
+async def perms_threads(ctx):
+    m = ctx.guild.get_member(bot.user.id)
+    ch = ctx.channel
+    p = ch.permissions_for(m)
+    lines = [
+        f"manage_threads: {p.manage_threads}",
+        f"create_public_threads: {p.create_public_threads}",
+        f"create_private_threads: {getattr(p,'create_private_threads', 'n/a')}",
+        f"send_messages_in_threads: {p.send_messages_in_threads}",
+        f"manage_channels: {p.manage_channels}",
+    ]
+    await ctx.send("```" + "\n".join(lines) + "```")
+@bot.command(name='perms_threads')
+async def perms_threads(ctx):
+    m = ctx.guild.get_member(bot.user.id)
+    ch = ctx.channel
+    p = ch.permissions_for(m)
+    lines = [
+        f"manage_threads: {p.manage_threads}",
+        f"create_public_threads: {p.create_public_threads}",
+        f"create_private_threads: {getattr(p,'create_private_threads', 'n/a')}",
+        f"send_messages_in_threads: {p.send_messages_in_threads}",
+        f"manage_channels: {p.manage_channels}",
+    ]
+    await ctx.send("```" + "\n".join(lines) + "```")
+

@@ -182,6 +182,30 @@ class UndoButton(_BaseBtn):
     async def callback(self,it): await self._handle(it,'accepted')
 
 
+@bot.event
+async def on_ready():
+    try:
+        logger.info(f'{bot.user} has landed!')
+        logger.info(f"Bot is in {len(bot.guilds)} guilds")
+    except Exception:
+        pass
+    # init_database は存在すれば実行
+    try:
+        init_database()
+    except Exception as e:
+        try: logger.warning(f"[on_ready] init_database skipped: {e}")
+        except Exception: pass
+    # 各ギルドでロール作成（存在すれば）
+    try:
+        for guild in bot.guilds:
+            try:
+                await setup_roles(guild)
+            except Exception as e:
+                try: logger.warning(f"[on_ready] setup_roles skipped in {guild.id}: {e}")
+                except Exception: pass
+    except Exception as e:
+        try: logger.warning(f"[on_ready] guild loop skipped: {e}")
+        except Exception: pass
 
 @bot.event
 async def on_interaction(interaction):
@@ -937,418 +961,6 @@ if not hasattr(bot, "_orig_process_commands"):
     bot.process_commands = _guarded
 # ==== /PROCESS_GUARD_FINAL ====
 
-# ==== SLASH_ASSIGN ====
-import discord as __d
-from discord import app_commands as __ac
-import sqlite3 as __sq
-
-# 期日パースは既存の parse_date を使う前提（無い場合は "明日 18:00" 等だけで十分）
-@__ac.command(name="指示", description="担当者にタスクを指示します")
-@__ac.describe(担当者="担当者を選択", 期日="例: 明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00", タスク名="タスクのタイトル")
-async def slash_assign(inter: __d.Interaction, 担当者: __d.Member, 期日: str, タスク名: str):
-    try:
-        # 期日
-        try:
-            due = parse_date(期日)
-        except Exception:
-            due = None
-        if not due:
-            await inter.response.send_message("❌ 期日が読めませんでした。例: 明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00", ephemeral=True)
-            return
-
-        # DB INSERT（lastrowid 取得）
-        try:
-            conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
-            cur.execute(
-                "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (inter.guild.id, inter.user.id, 担当者.id, タスク名, due, 0, 0)
-            )
-            tid=cur.lastrowid
-            conn.commit(); conn.close()
-        except Exception as e:
-            try: conn.close()
-            except: pass
-            await inter.response.send_message("❌ DBエラーで作成できませんでした。", ephemeral=True)
-            return
-
-        # 個人CH通知（既存の関数があれば使用）
-        try:
-            # 既にあなたの環境にある send_task_notification を使う（thread作成・button等）
-            await send_task_notification(inter.guild, 担当者, inter.user, タスク名, due, 0, task_id=tid)
-        except Exception as e:
-            # フォールバック通知（最低限）
-            ch = __d.utils.get(inter.guild.channels, name=f"to-{担当者.display_name}")
-            if not ch:
-                try:
-                    ow={inter.guild.default_role:__d.PermissionOverwrite(read_messages=False),
-                        担当者:__d.PermissionOverwrite(read_messages=True, send_messages=True)}
-                    ch=await inter.guild.create_text_channel(f"to-{担当者.display_name}", overwrites=ow,
-                                                             topic=f"{担当者.display_name}の個人タスク管理チャンネル")
-                except Exception:
-                    try: ch=await 担当者.create_dm()
-                    except: ch=None
-            if ch:
-                emb=__d.Embed(title=f"📋 {タスク名}",
-                               description=f"**期日: {due.strftime('%Y/%m/%d %H:%M')}**",
-                               color=__d.Color.gold())
-                await ch.send(担当者.mention, embed=emb)
-
-        # 送信者にも結果を返す
-        await inter.response.send_message(f"✅ 指示しました：**{担当者.display_name}** / {タスク名}（期日: {due.strftime('%Y/%m/%d %H:%M')}）", ephemeral=True)
-    except Exception as e:
-        try:
-            await inter.response.send_message("❌ 実行中にエラーが発生しました。", ephemeral=True)
-        except Exception:
-            pass
-
-# setup_hookで登録＆同期
-_old_setup_hook = getattr(bot, "setup_hook", None)
-@bot.event
-async def setup_hook():
-    if callable(_old_setup_hook):
-        try: await _old_setup_hook()
-        except TypeError: pass
-    try:
-        bot.tree.add_command(slash_assign)
-        await bot.tree.sync()
-        logger.info("[slash] /指示 を登録しました")
-    except Exception as e:
-        try: logger.error(f"[slash] 登録失敗: {e}", exc_info=True)
-        except Exception: pass
-# ==== /SLASH_ASSIGN ====
-
-# ==== SLASH_ASSIGN (確実登録 + ギルド即時同期) ====
-import discord as _d
-from discord import app_commands as _ac
-import sqlite3 as _sq
-
-@_ac.command(name="指示", description="担当者にタスクを指示します")
-@_ac.describe(担当者="担当者を選択", 期日="例: 明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00", タスク名="タスクのタイトル")
-async def 指示(inter: _d.Interaction, 担当者: _d.Member, 期日: str, タスク名: str):
-    try:
-        # 期日を既存パーサで
-        try:
-            due = parse_date(期日)
-        except Exception:
-            due = None
-        if not due:
-            await inter.response.send_message("❌ 期日が読めませんでした。\n例：明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00", ephemeral=True)
-            return
-
-        # DB登録（lastrowid）
-        try:
-            conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
-            cur.execute(
-                "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (inter.guild.id, inter.user.id, 担当者.id, タスク名, due, 0, 0)
-            )
-            tid=cur.lastrowid
-            conn.commit(); conn.close()
-        except Exception:
-            try: conn.close()
-            except: pass
-            await inter.response.send_message("❌ DBエラーで作成できませんでした。", ephemeral=True)
-            return
-
-        # 個人CH通知（既存関数があれば利用）
-        try:
-            await send_task_notification(inter.guild, 担当者, inter.user, タスク名, due, 0, task_id=tid)
-        except Exception:
-            # 最低限のフォールバック通知
-            ch = _d.utils.get(inter.guild.channels, name=f"to-{担当者.display_name}")
-            if not ch:
-                try:
-                    ow={inter.guild.default_role:_d.PermissionOverwrite(read_messages=False),
-                        担当者:_d.PermissionOverwrite(read_messages=True, send_messages=True)}
-                    ch=await inter.guild.create_text_channel(f"to-{担当者.display_name}", overwrites=ow,
-                                                             topic=f"{担当者.display_name}の個人タスク管理チャンネル")
-                except Exception:
-                    try: ch=await 担当者.create_dm()
-                    except: ch=None
-            if ch:
-                emb=_d.Embed(title=f"📋 {タスク名}",
-                              description=f"**期日: {due.strftime('%Y/%m/%d %H:%M')}**",
-                              color=_d.Color.gold())
-                await ch.send(担当者.mention, embed=emb)
-
-        await inter.response.send_message(
-            f"✅ 指示しました：**{担当者.display_name}** / {タスク名}（期日: {due.strftime('%Y/%m/%d %H:%M')}）",
-            ephemeral=True
-        )
-    except Exception as e:
-        try: await inter.response.send_message("❌ 実行中にエラーが発生しました。", ephemeral=True)
-        except Exception: pass
-
-# 既存 setup_hook があっても共存させ、全参加サーバーに即時同期
-_old_setup_hook = getattr(bot, "setup_hook", None)
-@bot.event
-async def setup_hook():
-    if callable(_old_setup_hook):
-        try: await _old_setup_hook()
-        except TypeError: pass
-
-    # コマンドをツリーに追加（重複ならOK）
-    try:
-        try: bot.tree.add_command(指示)
-        except Exception: pass
-
-        # 参加している各サーバーにギルド同期（グローバル待ち時間を回避）
-        ok=0
-        for g in bot.guilds:
-            try:
-                await bot.tree.sync(guild=_d.Object(id=g.id))
-                ok+=1
-            except Exception as e:
-                try: logger.warning(f"[slash] sync failed in {g.id}: {e}")
-                except Exception: pass
-        try: logger.info(f"[slash] /指示 を {ok} guild(s) に同期しました")
-        except Exception: pass
-    except Exception as e:
-        try: logger.error(f"[slash] 登録失敗: {e}", exc_info=True)
-        except Exception: pass
-
-# 管理者向け：手動同期（/指示が出ない時の救済）
-@bot.command(name="sync")
-@commands.has_permissions(administrator=True)
-async def cmd_sync(ctx):
-    try:
-        cnt=0
-        for g in bot.guilds:
-            await bot.tree.sync(guild=_d.Object(id=g.id)); cnt+=1
-        await ctx.reply(f"Slashコマンドを同期しました（{cnt} guild）")
-    except Exception as e:
-        await ctx.reply(f"同期に失敗しました：{e}")
-# ==== /SLASH_ASSIGN ====
-
-# ==== TEXT_SLASH_ASSIGN_FALLBACK ====
-import re as __re, discord as __d, sqlite3 as __sq, datetime as __dt
-
-@bot.listen("on_message")
-async def __text_slash_assign(msg: __d.Message):
-    """
-    文字で `/指示 担当者:@〇〇 期日:"…" タスク名:"…"` と書かれたメッセージを解析して実行。
-    例: /指示 担当者:@山田 期日:"明日 18:00" タスク名:"レポート提出"
-    """
-    try:
-        if msg.author.bot or (msg.guild is None):
-            return
-        t = (msg.content or "").strip()
-        if not t.startswith("/指示"):
-            return
-
-        # 担当者はメンションから拾う（最初のユーザー）
-        assignees = [m for m in msg.mentions if m.id != (bot.user.id if bot.user else 0)]
-        if not assignees:
-            await msg.reply("❌ 担当者を @メンション してください。\n例）/指示 担当者:@山田 期日:\"明日 18:00\" タスク名:\"レポート提出\"")
-            return
-        assignee = assignees[0]
-
-        # 期日・タスク名は 日本語キー + 二重引用符 で抜き出す
-        m_due  = __re.search(r'期日\s*[:：]\s*"([^"]+)"', t)
-        m_task = __re.search(r'タスク名\s*[:：]\s*"([^"]+)"', t)
-        if not (m_due and m_task):
-            await msg.reply("❌ 形式が不正です。\n例）/指示 担当者:@山田 期日:\"明日 18:00\" タスク名:\"レポート提出\"")
-            return
-        due_str  = m_due.group(1).strip()
-        task_name = m_task.group(1).strip()
-
-        # 期日パース（既存の parse_date を使用）
-        try:
-            due = parse_date(due_str)
-        except Exception:
-            due = None
-        if not due:
-            await msg.reply("❌ 期日が読めませんでした。例：明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00")
-            return
-
-        # DB INSERT（lastrowid を取得）
-        try:
-            conn = __sq.connect('reminder_bot.db'); cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (msg.guild.id, msg.author.id, assignee.id, task_name, due, msg.id, msg.channel.id)
-            )
-            tid = cur.lastrowid
-            conn.commit(); conn.close()
-        except Exception as e:
-            try: conn.close()
-            except: pass
-            await msg.reply("❌ DBエラーで作成できませんでした。")
-            return
-
-        # 個人チャンネル通知（既存の send_task_notification があれば使う）
-        try:
-            await send_task_notification(msg.guild, assignee, msg.author, task_name, due, msg.id, task_id=tid)
-        except Exception:
-            # フォールバック（最低限の通知）
-            ch = __d.utils.get(msg.guild.channels, name=f"to-{assignee.display_name}")
-            if not ch:
-                try:
-                    ow={msg.guild.default_role:__d.PermissionOverwrite(read_messages=False),
-                        assignee:__d.PermissionOverwrite(read_messages=True, send_messages=True)}
-                    ch = await msg.guild.create_text_channel(f"to-{assignee.display_name}", overwrites=ow,
-                                                             topic=f"{assignee.display_name}の個人タスク管理チャンネル")
-                except Exception:
-                    try: ch = await assignee.create_dm()
-                    except: ch=None
-            if ch:
-                emb=__d.Embed(title=f"📋 {task_name}",
-                               description=f"**期日: {due.strftime('%Y/%m/%d %H:%M')}**",
-                               color=__d.Color.gold())
-                await ch.send(assignee.mention, embed=emb)
-
-        await msg.reply(f"✅ 指示しました：**{assignee.display_name}** / {task_name}（期日: {due.strftime('%Y/%m/%d %H:%M')}）")
-    except Exception as e:
-        try: logger.error(f"[text /指示] {e}", exc_info=True)
-        except: pass
-# ==== /TEXT_SLASH_ASSIGN_FALLBACK ====
-
-# ==== PREFIX_ASSIGN_COMMAND ====
-import re as _re, sqlite3 as _sq, discord as _dd
-
-@bot.command(name="指示")
-async def cmd_assign(ctx):
-    """
-    使い方：!指示 @担当者1 [@担当者2 ...], 期日, タスク名
-    例：  !指示 @山田, 明日 18:00, レポート提出
-    """
-    try:
-        text = ctx.message.content
-        # 先頭の "!指示" を剥がす
-        t = _re.sub(r'^\s*!指示\s*', '', text).strip()
-        # メンション以外の文字列から最初のカンマ位置を探す（全角/半角対応）
-        # 形式： @A @B , 期日 , タスク名
-        # まずメンション群を捌く（Bot自身は除外）
-        assignees = [m for m in ctx.message.mentions if m.id != (bot.user.id if bot.user else 0)]
-        if not assignees:
-            await ctx.reply("❌ 担当者を @メンション してください。\n例：`!指示 @山田, 明日 18:00, レポート提出`")
-            return
-
-        # メンション表記を本文から削除した上で、カンマで分割
-        t_wo_mentions = _re.sub(r'<@!?[0-9]+>', '', t).strip()
-        parts = [p.strip() for p in _re.split(r'[，,]', t_wo_mentions, maxsplit=2)]
-        if len(parts) < 3:
-            await ctx.reply("❌ 形式：`!指示 @担当者, 期日, タスク名`（**半角`,` を2つ**。全角も可）")
-            return
-        due_str, task_name = parts[1], parts[2]
-        if not task_name:
-            await ctx.reply("❌ タスク名が空です。"); return
-
-        # 期日パース（既存の parse_date を使用）
-        try:
-            due = parse_date(due_str)
-        except Exception:
-            due = None
-        if not due:
-            await ctx.reply("❌ 期日が読めませんでした。例：明日 18:00 / 3日後 / 金曜 14:30 / 2025/09/01 09:00")
-            return
-
-        created = 0
-        for target in assignees:
-            # DB Insert（lastrowid）
-            try:
-                conn=_sq.connect('reminder_bot.db'); cur=conn.cursor()
-                cur.execute(
-                    "INSERT INTO tasks (guild_id,instructor_id,assignee_id,task_name,due_date,message_id,channel_id) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (ctx.guild.id, ctx.author.id, target.id, task_name, due, ctx.message.id, ctx.channel.id)
-                )
-                tid=cur.lastrowid
-                conn.commit(); conn.close()
-            except Exception as e:
-                try: conn.close()
-                except: pass
-                continue
-
-            # 個人チャンネル通知（既存の関数があれば利用）
-            try:
-                await send_task_notification(ctx.guild, target, ctx.author, task_name, due, ctx.message.id, task_id=tid)
-            except Exception:
-                # 最低限のフォールバック通知
-                ch = _dd.utils.get(ctx.guild.channels, name=f"to-{target.display_name}")
-                if not ch:
-                    try:
-                        ow={ctx.guild.default_role:_dd.PermissionOverwrite(read_messages=False),
-                            target:_dd.PermissionOverwrite(read_messages=True, send_messages=True)}
-                        ch=await ctx.guild.create_text_channel(f"to-{target.display_name}", overwrites=ow,
-                                                               topic=f"{target.display_name}の個人タスク管理チャンネル")
-                    except Exception:
-                        try: ch=await target.create_dm()
-                        except: ch=None
-                if ch:
-                    emb=_dd.Embed(title=f"📋 {task_name}",
-                                   description=f"**期日: {due.strftime('%Y/%m/%d %H:%M')}**",
-                                   color=_dd.Color.gold())
-                    await ch.send(target.mention, embed=emb)
-
-            created += 1
-
-        await ctx.reply(f"✅ {created}件のタスクを指示しました。" if created else "❌ 作成に失敗しました。")
-    except Exception as e:
-        try: logger.error(f"[cmd_assign] {e}", exc_info=True)
-        except: pass
-        await ctx.reply("❌ 実行中にエラーが発生しました。")
-# ==== /PREFIX_ASSIGN_COMMAND ====
-
-
-# ==== PING_COMMAND ====
-@bot.command(name="ping")
-async def _ping(ctx):
-    try:
-        await ctx.reply("pong")
-    except Exception as e:
-        try: logger.error(f"[ping] {e}", exc_info=True)
-        except: pass
-# ==== /PING_COMMAND ====
-
-# ==== CLEAN_SETUP_HOOK ====
-import discord as _d, asyncio as _a, logging as _lg
-log = _lg.getLogger(__name__)
-
-async def __clean_setup_hook():
-    await bot.wait_until_ready()
-    try:
-        log.info(f"{bot.user} has landed!")
-        log.info(f"Bot is in {len(bot.guilds)} guilds")
-    except Exception:
-        pass
-    # init_database / setup_roles は存在すれば実行（無ければ静かにスキップ）
-    try:
-        init_database()
-        log.info("[startup] init_database OK")
-    except Exception as e:
-        try: log.warning(f"[startup] init_database skipped: {e}")
-        except: pass
-    try:
-        for g in bot.guilds:
-            try: 
-                await setup_roles(g)
-            except Exception as e:
-                try: log.warning(f"[startup] setup_roles skipped in {getattr(g,'id',None)}: {e}")
-                except: pass
-    except Exception:
-        pass
-    # プレゼンスをONLINEに
-    try:
-        await bot.change_presence(
-            status=_d.Status.online,
-            activity=_d.Activity(type=_d.ActivityType.watching, name="タスク受付中")
-        )
-    except Exception:
-        pass
-
-# 既存の setup_hook をすべて無視して“これだけ”使う
-bot.setup_hook = __clean_setup_hook
-# ==== /CLEAN_SETUP_HOOK ====
-
-
-
-
-
-
 if __name__ == "__main__":
     import os
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -1675,6 +1287,39 @@ async def __rename_min(thread: __dd.Thread, status: str):
     if new != cur:
         await thread.edit(name=new)
 
+@bot.command(name='紐付け', aliases=['bind'])
+async def bind_thread_command(ctx, task_id: int):
+    """（スレッド内）このスレッドを指定Task IDに紐付けて、色も即同期します"""
+    try:
+        if not isinstance(ctx.channel, __dd.Thread):
+            await ctx.reply("このコマンドは**スレッドの中**で実行してください。")
+            return
+
+        # DBに thread_id を保存
+        conn=__sq.connect('reminder_bot.db'); cur=conn.cursor()
+        cur.execute("UPDATE tasks SET thread_id=? WHERE id=?", (ctx.channel.id, task_id))
+        if cur.rowcount == 0:
+            conn.commit(); conn.close()
+            await ctx.reply(f"❌ Task ID {task_id} が見つかりません。")
+            return
+        conn.commit(); conn.close()
+
+        # 直ちに色を同期
+        status = await __helper_read_status_by_id(task_id)
+        try:
+            # 既にある helper があれば使う
+            if '_rename_thread_to_status' in globals():
+                await _rename_thread_to_status(ctx.channel, status)
+            else:
+                await __rename_min(ctx.channel, status)
+        except Exception:
+            await __rename_min(ctx.channel, status)
+
+        await ctx.reply(f"✅ 紐付け完了（Task ID {task_id} / status={status}）")
+    except Exception as e:
+        try: logger.error(f"[bind] error: {e}", exc_info=True)
+        except: pass
+        await ctx.reply("❌ 紐付け中にエラーが発生しました。")
 # ==== /BIND_THREAD_TO_TASK ====
 # ==== INIT_DB_AND_ROLES (日本語版/エラー安全) ====
 def init_database():

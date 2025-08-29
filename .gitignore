@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+*.pyo
+*.pyd
+
+# Envs
+.env
+.venv/
+venv/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Logs & DB
+*.log
+run.log
+bot.log
+bot_output.log
+*.sqlite
+*.db
+
+# Backups
+*.bak
+
+# Build
+build/
+dist/
+
+# Local
+reminder_bot.db 

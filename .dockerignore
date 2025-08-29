@@ -1,0 +1,17 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.log
+run.log
+bot.log
+bot_output.log
+*.bak
+.DS_Store
+.env
+venv/
+.idea/
+.vscode/ 
