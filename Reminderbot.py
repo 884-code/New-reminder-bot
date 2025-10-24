@@ -92,7 +92,7 @@ async def ensure_mgmt(guild:discord.Guild) -> Optional[discord.TextChannel]:
         return None
 
 async def ensure_personal(guild:discord.Guild, user:discord.Member) -> Optional[discord.TextChannel]:
-    name = f"to-{user.display_name}".lower().replace(" ","-")
+    name = f"{user.display_name}へ".replace(" ","")
     ch = discord.utils.get(guild.channels, name=name)
     if isinstance(ch, discord.TextChannel):
         return ch
